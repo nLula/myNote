@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>myNote</title>
+  <link rel="icon" href="{{ url_for('static', filename='images/myNote.ico') }}" type="image/x-icon" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ cache_bust }}" />
+</head>
+<body>
+
+  <!-- Custom title bar — hidden in browser dev mode, activated by pywebviewready -->
+  <div id="titlebar">
+    <div id="titlebar-drag">
+      <span id="titlebar-title">myNote</span>
+    </div>
+    <div id="titlebar-controls">
+      <button id="tb-minimize" title="Minimize">
+        <svg viewBox="0 0 10 1" xmlns="http://www.w3.org/2000/svg">
+          <line x1="0" y1="0.5" x2="10" y2="0.5" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+      </button>
+      <button id="tb-maximize" title="Maximize / Restore">
+        <svg viewBox="0 0 10 10" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0.75" y="0.75" width="8.5" height="8.5" fill="none"
+                stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+      </button>
+      <button id="tb-close" title="Close">
+        <svg viewBox="0 0 10 10" xmlns="http://www.w3.org/2000/svg">
+          <line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" stroke-width="1.4"/>
+          <line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" stroke-width="1.4"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="app">
+
+    <!-- Column 1: Tags -->
+    <div class="col" id="col-tags">
+      <div class="col-header">Tags</div>
+      <ul id="tag-list"></ul>
+    </div>
+
+    <div class="col-handle" id="handle-1"></div>
+
+    <!-- Column 2: Notes (search bar replaces header) -->
+    <div class="col" id="col-notes">
+      <div class="col-search-bar">
+        <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input type="search" id="search-input" placeholder="Search notes…"
+               autocomplete="off" spellcheck="false" />
+      </div>
+      <ul id="note-list"></ul>
+    </div>
+
+    <div class="col-handle" id="handle-2"></div>
+
+    <!-- Column 3: toolbar + content -->
+    <div class="col" id="col-content">
+
+      <div class="content-toolbar">
+        <div class="toolbar-actions">
+          <button class="tool-btn" id="btn-new"   title="New note">
+            <img src="{{ url_for('static', filename='images/plus.png') }}"   alt="New note" />
+          </button>
+          <button class="tool-btn" id="btn-edit"  title="Edit">
+            <img src="{{ url_for('static', filename='images/pencil.png') }}" alt="Edit" />
+          </button>
+          <button class="tool-btn" id="btn-tags"  title="Tags">
+            <img src="{{ url_for('static', filename='images/tag.png') }}"    alt="Tags" />
+          </button>
+          <button class="tool-btn" id="btn-trash" title="Move to Trash" disabled>
+            <img src="{{ url_for('static', filename='images/trash.png') }}"  alt="Trash" />
+          </button>
+          <button class="tool-btn" id="btn-lock"   title="Lock note" disabled>
+            <img src="{{ url_for('static', filename='images/lock.png') }}"   alt="Lock" />
+          </button>
+          <button class="tool-btn" id="btn-export" title="Export as PDF" disabled>
+            <img src="{{ url_for('static', filename='images/export.png') }}" alt="Export" />
+          </button>
+          <button class="tool-btn" id="btn-share" title="Share as HTML file" disabled>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+              <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+            </svg>
+          </button>
+        </div>
+
+        <div id="note-title" class="note-title">
+          <span id="note-meta-primary">Select a note</span>
+          <span id="note-meta-secondary"></span>
+        </div>
+
+        <div class="toolbar-right">
+          <button id="theme-toggle" aria-label="Toggle theme" title="Toggle light / dark mode">
+            <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="5"/>
+              <line x1="12" y1="1"  x2="12" y2="3"/>  <line x1="12" y1="21" x2="12" y2="23"/>
+              <line x1="4.22" y1="4.22"  x2="5.64" y2="5.64"/>
+              <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+              <line x1="1"  y1="12" x2="3"  y2="12"/>  <line x1="21" y1="12" x2="23" y2="12"/>
+              <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+              <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+            </svg>
+            <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+          </button>
+          <button id="btn-settings" aria-label="Settings" title="Settings">
+            <img src="{{ url_for('static', filename='images/gear.png') }}" alt="Settings" />
+          </button>
+        </div>
+      </div>
+
+      <!-- View mode: rendered markdown -->
+      <div id="note-view" class="note-view"></div>
+
+      <!-- Edit mode: raw textarea -->
+      <textarea id="note-edit" class="note-edit" spellcheck="false"
+                placeholder="Start writing…"></textarea>
+
+    </div>
+
+  </div>
+
+  <!-- Tag popover — rendered outside .app so it's never clipped -->
+  <div id="tag-popover" class="tag-popover tag-popover-hidden">
+    <div id="tag-chip-list" class="tag-chip-list"></div>
+    <input type="text" id="tag-input-field" class="tag-input-field"
+           placeholder="Add tag" autocomplete="off" spellcheck="false" />
+    <div id="tag-suggestions" class="tag-suggestions"></div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal-overlay hidden">
+    <div class="settings-dialog">
+      <button class="dialog-close-btn" id="settings-close" title="Close">×</button>
+      <div class="settings-left-panel">
+        <div class="settings-nav">
+          <div class="settings-nav-item active" data-panel="workfolder">myNotes folder</div>
+          <div class="settings-nav-divider"></div>
+          <div class="settings-nav-item" data-panel="email">Email</div>
+          <div class="settings-nav-item" data-panel="telegram">Telegram</div>
+          <div class="settings-nav-item" data-panel="locked">Locked Notes</div>
+          <div class="settings-nav-item" data-panel="passwords">Import passwords</div>
+          <div class="settings-nav-item" data-panel="notable">Import Notable</div>
+        </div>
+      </div>
+      <div class="settings-right-panel">
+
+        <div id="settings-panel-workfolder" class="settings-panel active">
+          <h3 class="settings-panel-title">myNotes Folder</h3>
+          <p class="settings-panel-hint">
+            Choose the folder where <strong>all your notes and attachments</strong> will be stored.
+            You can use any local or cloud-synced folder (OneDrive, Dropbox, etc.).
+            Attachment sub-folders (<em>images</em>, <em>documents</em>, <em>archives</em>,
+            <em>videos</em>) are created automatically. This path is saved per-machine in the
+            app config, so it can differ between computers.
+          </p>
+          <div class="settings-field">
+            <label for="workfolder-path">Notes folder path</label>
+            <div class="notable-path-row">
+              <input type="text" id="workfolder-path"
+                     placeholder="C:\Users\you\Documents\myNotes"
+                     autocomplete="off" spellcheck="false" />
+              <button class="btn-secondary" id="workfolder-browse-btn">Browse…</button>
+            </div>
+          </div>
+          <div class="settings-actions">
+            <span class="import-status" id="workfolder-status"></span>
+            <button class="btn-primary" id="workfolder-save-btn">Save</button>
+          </div>
+        </div>
+
+        <div id="settings-panel-email" class="settings-panel">
+          <h3 class="settings-panel-title">Email</h3>
+          <div class="settings-field">
+            <label for="settings-email-addr">Email address</label>
+            <input type="email" id="settings-email-addr" placeholder="user@example.com"
+                   autocomplete="email" spellcheck="false" />
+          </div>
+          <div class="settings-field">
+            <label for="settings-email-pass">Password</label>
+            <input type="password" id="settings-email-pass" placeholder="Email password"
+                   autocomplete="current-password" />
+          </div>
+          <div class="settings-actions">
+            <button class="btn-secondary" id="settings-cancel-btn">Cancel</button>
+            <button class="btn-primary"   id="settings-save-btn">Save</button>
+          </div>
+        </div>
+        <div id="settings-panel-telegram" class="settings-panel">
+          <h3 class="settings-panel-title">Telegram</h3>
+
+          <!-- Wizard progress indicator -->
+          <div class="tg-wizard-steps">
+            <div class="tg-wizard-dot active" data-step="credentials">1</div>
+            <div class="tg-wizard-line" data-after="credentials"></div>
+            <div class="tg-wizard-dot" data-step="verify">2</div>
+            <div class="tg-wizard-line" data-after="verify"></div>
+            <div class="tg-wizard-dot" data-step="channel">3</div>
+            <div class="tg-wizard-line" data-after="channel"></div>
+            <div class="tg-wizard-dot" data-step="connected">4</div>
+          </div>
+
+          <!-- ── Step 1: API credentials + phone ──────────────────────────── -->
+          <div id="tg-step-credentials">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 1 of 4 — Get Telegram API Keys</span>
+            </div>
+            <div class="tg-guide">
+              <p>To connect myNote to your Telegram account you need a personal <strong>API ID</strong> and <strong>API Hash</strong>. This is free and takes about 2 minutes:</p>
+              <ol class="tg-guide-steps">
+                <li>Click <button class="tg-open-link" id="tg-open-mytelegram">my.telegram.org/apps ↗</button> to open it in your browser</li>
+                <li>Log in with the phone number you use for Telegram</li>
+                <li>Click <strong>API development tools</strong></li>
+                <li>Fill in <em>App title</em> (e.g. <em>myNote</em>) and <em>Short name</em> (e.g. <em>mynote</em>) — any values work</li>
+                <li>Click <strong>Create application</strong></li>
+                <li>Copy the <strong>App api_id</strong> and <strong>App api_hash</strong> shown on that page</li>
+              </ol>
+            </div>
+            <div class="tg-cred-row">
+              <div class="settings-field" style="flex:1">
+                <label for="settings-tg-api-id">API ID</label>
+                <input type="text" id="settings-tg-api-id" placeholder="12345678"
+                       autocomplete="off" spellcheck="false" />
+              </div>
+              <div class="settings-field" style="flex:2">
+                <label for="settings-tg-api-hash">API Hash</label>
+                <input type="password" id="settings-tg-api-hash" placeholder="0123456789abcdef…"
+                       autocomplete="off" spellcheck="false" />
+              </div>
+            </div>
+            <div class="settings-field">
+              <label for="settings-tg-phone">Your Telegram phone number (with country code)</label>
+              <input type="text" id="settings-tg-phone" placeholder="+1 234 567 8900"
+                     autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="settings-actions">
+              <span id="settings-tg-status" class="tg-status"></span>
+              <button class="btn-primary" id="settings-tg-sendcode-btn">Send Code →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 2: Verify code ────────────────────────────────────────── -->
+          <div id="tg-step-verify" class="hidden">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 2 of 4 — Verify Your Phone</span>
+            </div>
+            <div class="tg-guide">
+              <p>Telegram just sent a <strong>login code</strong> to your Telegram app on your phone or desktop. Open Telegram and look for a message from <strong>Telegram</strong>.</p>
+              <p class="tg-guide-note">If you have two-factor authentication (2FA) enabled you will be asked for your 2FA password after entering the code.</p>
+            </div>
+            <div class="settings-field">
+              <label for="settings-tg-code">Login code from Telegram</label>
+              <input type="text" id="settings-tg-code" placeholder="12345"
+                     autocomplete="off" spellcheck="false" />
+            </div>
+            <div id="tg-2fa-field" class="settings-field hidden">
+              <label for="settings-tg-2fa">Two-factor password (2FA)</label>
+              <input type="password" id="settings-tg-2fa" placeholder="Your 2FA password"
+                     autocomplete="off" />
+            </div>
+            <div class="settings-actions">
+              <span id="settings-tg-status-verify" class="tg-status"></span>
+              <button class="btn-secondary" id="settings-tg-back-btn">← Back</button>
+              <button class="btn-primary"   id="settings-tg-verify-btn">Verify →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 3: Create channel + select it ─────────────────────────── -->
+          <div id="tg-step-channel" class="hidden">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 3 of 4 — Create Your Private Channel</span>
+            </div>
+            <div class="tg-guide">
+              <p>myNote saves messages and files sent to a <strong>private Telegram channel</strong> as notes. Create a dedicated channel now:</p>
+              <ol class="tg-guide-steps">
+                <li>Open <strong>Telegram</strong> on your phone or desktop</li>
+                <li>Tap the <strong>compose / pencil</strong> icon → <strong>New Channel</strong></li>
+                <li>Name it <strong>myNotes</strong> (or any name you like)</li>
+                <li>Select <strong>Private Channel</strong></li>
+                <li>Skip adding subscribers and tap <strong>Create</strong></li>
+                <li>Send a test message to the channel so it appears in the list</li>
+              </ol>
+              <p class="tg-guide-note">Already have a channel you want to use? Just click Browse below.</p>
+            </div>
+            <div class="settings-field">
+              <label>Select or paste your channel</label>
+              <div class="tg-chat-row">
+                <input type="text" id="settings-tg-chat" placeholder="-100123456789 or @channelname"
+                       autocomplete="off" spellcheck="false" />
+                <button class="btn-secondary" id="settings-tg-browse-btn">Browse</button>
+              </div>
+              <div id="tg-dialogs-list" class="tg-dialogs-list hidden"></div>
+            </div>
+            <div class="settings-actions">
+              <span id="settings-tg-status-channel" class="tg-status"></span>
+              <button class="btn-primary" id="settings-tg-connect-btn">Connect Channel →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 4: All set — polling config ───────────────────────────── -->
+          <div id="tg-step-connected" class="hidden">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 4 of 4 — Connected</span>
+            </div>
+            <div class="tg-info-table">
+              <div class="tg-info-row">
+                <span class="tg-info-label">Account</span>
+                <span id="tg-connected-name" class="tg-info-value">—</span>
+                <button class="btn-secondary" id="settings-tg-logout-btn">Log out</button>
+              </div>
+              <div class="tg-info-row">
+                <span class="tg-info-label">Channel</span>
+                <span id="tg-connected-channel-id" class="tg-info-value">—</span>
+                <button class="btn-secondary" id="settings-tg-change-channel-btn">Change</button>
+              </div>
+            </div>
+            <div class="settings-field-row" style="margin-top:12px">
+              <label class="settings-toggle-label">
+                <input type="checkbox" id="settings-tg-enabled" />
+                <span>Enable polling every</span>
+                <select id="settings-tg-interval" class="tg-interval-select">
+                  <option value="30"   selected>30 s</option>
+                  <option value="300"  >5 m</option>
+                  <option value="600"  >10 m</option>
+                  <option value="900"  >15 m</option>
+                  <option value="1800" >30 m</option>
+                  <option value="3600" >1 h</option>
+                </select>
+              </label>
+              <span id="settings-tg-status-conn" class="tg-status"></span>
+            </div>
+            <div class="settings-actions">
+              <button class="btn-secondary" id="settings-tg-reset-btn"
+                      title="Re-read all messages on next poll">Reset sync</button>
+              <button class="btn-primary"   id="settings-tg-save-btn">Save</button>
+            </div>
+          </div>
+        </div>
+        <div id="settings-panel-locked" class="settings-panel">
+          <h3 class="settings-panel-title">Locked Notes</h3>
+          <p class="settings-panel-hint">Click × to permanently decrypt a note. You will be asked for its password.</p>
+          <div id="locked-notes-list" class="locked-notes-list"></div>
+        </div>
+
+        <div id="settings-panel-passwords" class="settings-panel">
+          <h3 class="settings-panel-title">Import Passwords</h3>
+          <p class="settings-panel-hint">Reads saved passwords from your browser and creates a note tagged <em>passwords</em>. You can lock it afterwards.</p>
+          <div class="settings-field">
+            <label>Browser</label>
+            <div class="browser-radio-group">
+              <div class="browser-radio-btn selected" data-browser="chrome">Chrome</div>
+              <div class="browser-radio-btn" data-browser="edge">Edge</div>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label for="import-pwd-title">Note title</label>
+            <input type="text" id="import-pwd-title" value="Passwords from Chrome"
+                   autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="settings-actions">
+            <span class="import-status" id="import-pwd-status"></span>
+            <button class="btn-primary" id="import-pwd-btn">Import</button>
+          </div>
+          <pre id="import-debug-box" class="import-debug hidden"></pre>
+          <div class="settings-field" style="margin-top:6px">
+            <label class="settings-panel-hint" style="margin:0">
+              Chrome 127+? Use
+              <em>chrome://password-manager/settings → Export passwords → CSV</em>,
+              then pick the file here:
+            </label>
+            <input type="file" id="import-csv-file" accept=".csv"
+                   style="margin-top:6px;font-size:11px;color:var(--text-muted)" />
+          </div>
+        </div><!-- /settings-panel-passwords -->
+
+        <div id="settings-panel-notable" class="settings-panel">
+          <h3 class="settings-panel-title">Import from Notable</h3>
+          <p class="settings-panel-hint">
+            Point to a Notable data folder (the one that contains a <em>notes/</em>
+            and an <em>attachments/</em> sub-folder). Notes are converted to myNote
+            format; images are placed in <em>attachments/images/</em>.
+            Already-existing notes are skipped.
+          </p>
+          <div class="settings-field">
+            <label for="notable-folder-path">Notable folder path</label>
+            <div class="notable-path-row">
+              <input type="text" id="notable-folder-path"
+                     placeholder="C:\Users\you\Documents\Notable"
+                     autocomplete="off" spellcheck="false" />
+              <button class="btn-secondary" id="notable-browse-btn"
+                      title="Browse for folder">Browse…</button>
+            </div>
+          </div>
+          <div class="settings-actions">
+            <span class="import-status" id="notable-import-status"></span>
+            <button class="btn-primary" id="notable-import-btn">Import</button>
+          </div>
+          <pre id="notable-import-log" class="import-debug hidden"></pre>
+        </div><!-- /settings-panel-notable -->
+      </div><!-- /settings-right-panel -->
+    </div><!-- /settings-dialog -->
+  </div><!-- /settings-modal -->
+
+  <!-- Lock / encrypt dialog -->
+  <div id="encrypt-dialog" class="modal-overlay hidden">
+    <div class="encrypt-dialog-box">
+      <h3 id="encrypt-dialog-title">Lock Note</h3>
+      <div class="dialog-fields">
+        <input type="password" id="encrypt-pass1" placeholder="Password"
+               autocomplete="new-password" spellcheck="false" />
+        <input type="password" id="encrypt-pass2" placeholder="Confirm password"
+               autocomplete="new-password" spellcheck="false" />
+      </div>
+      <p id="encrypt-error" class="encrypt-error"></p>
+      <div class="dialog-buttons">
+        <button class="btn-secondary" id="encrypt-cancel">CANCEL</button>
+        <button class="btn-primary"   id="encrypt-ok">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- General notification toast (SSE events, connectivity warnings, etc.) -->
+  <div id="notif-toast" class="notif-toast hidden">
+    <span id="notif-toast-msg"></span>
+    <button id="notif-toast-close" title="Dismiss">×</button>
+  </div>
+
+  <!-- Export toast notification -->
+  <div id="export-toast" class="export-toast hidden">
+    <div class="export-toast-body">
+      <span class="export-toast-icon">📄</span>
+      <span id="export-toast-msg"></span>
+    </div>
+    <button id="export-toast-close" title="Dismiss">×</button>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/marked.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/main.js') }}?v={{ cache_bust }}"></script>
+</body>
+</html>
