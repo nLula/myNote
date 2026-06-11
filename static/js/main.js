@@ -209,6 +209,22 @@ function enterViewMode() {
     // 4. Write to DOM, then decorate remaining doc/archive links with emoji icons
     noteView.innerHTML = injectMediaPlayers(marked.parse(encodeAttachmentUrls(noteBodyContent)));
     decorateAttachmentLinks(noteView);
+
+    // Inject copy buttons into fenced code blocks
+    noteView.querySelectorAll('pre').forEach(pre => {
+      const btn = document.createElement('button');
+      btn.className = 'code-copy-btn';
+      btn.textContent = 'Copy';
+      btn.addEventListener('click', () => {
+        const text = (pre.querySelector('code') || pre).innerText;
+        navigator.clipboard.writeText(text).then(() => {
+          btn.classList.add('copied');
+          btn.textContent = 'Copied!';
+          setTimeout(() => { btn.classList.remove('copied'); btn.textContent = 'Copy'; }, 2000);
+        }).catch(() => {});
+      });
+      pre.appendChild(btn);
+    });
   }
   colContent.classList.remove('editing');
   document.body.classList.remove('editing-active');
@@ -1007,20 +1023,73 @@ async function loadLockedNotesList() {
 // ── Work-folder setup state ────────────────────────────────────────────────
 let workfolderConfigured = false;
 
+/**
+ * Generic dirty tracker for a Save button.
+ *
+ * Pass an array of HTMLInputElement / HTMLSelectElement.
+ * Call .setBaseline() right after you load values from the server.
+ * Call .markClean()   right after a successful save.
+ *
+ * The button stays disabled until the user changes something from the baseline.
+ */
+function makeDirtyTracker(saveBtn, fields) {
+  let baseline = null;
+
+  function snapshot() {
+    return fields.map(f => (f.type === 'checkbox' ? String(f.checked) : f.value));
+  }
+
+  function refresh() {
+    if (baseline === null) { saveBtn.disabled = true; return; }
+    saveBtn.disabled = snapshot().every((v, i) => v === baseline[i]);
+  }
+
+  fields.forEach(f => {
+    f.addEventListener('change', refresh);
+    f.addEventListener('input',  refresh);
+  });
+
+  saveBtn.disabled = true;
+
+  return {
+    setBaseline() { baseline = snapshot(); saveBtn.disabled = true; },
+    markClean()   { baseline = snapshot(); saveBtn.disabled = true; },
+  };
+}
+
 /** Switch the visible settings panel + highlight the matching nav item. */
 function activateSettingsPanel(panelName) {
   document.querySelectorAll('.settings-nav-item').forEach(i =>
     i.classList.toggle('active', i.dataset.panel === panelName));
   document.querySelectorAll('.settings-panel').forEach(p =>
     p.classList.toggle('active', p.id === 'settings-panel-' + panelName));
+  // Lock/unlock right-panel scroll (storage panel must not scroll)
+  document.querySelector('.settings-right-panel').style.overflowY =
+    panelName === 'storage' ? 'hidden' : '';
+
+  // Show the refresh button only on the storage panel
+  document.getElementById('storage-refresh-btn').style.display =
+    panelName === 'storage' ? '' : 'none';
+
   if (panelName === 'telegram') loadTelegramSettings();
+  if (panelName === 'icloud')   loadIcloudSettings();
+  if (panelName === 'android')  loadAndroidSettings();
+  if (panelName === 'storage')  loadStorageSettings();
+  if (panelName === 'trash')    loadTrashSettings();
 }
 
+const _emailDirty = makeDirtyTracker(
+  document.getElementById('settings-save-btn'),
+  [document.getElementById('settings-email-addr'),
+   document.getElementById('settings-email-pass')]
+);
+
 function openSettings(panel) {
-  // Pre-fill email
+  // Pre-fill email and set baseline so Save is disabled until something changes
   api('/api/settings').then(s => {
     document.getElementById('settings-email-addr').value = s.email || '';
     document.getElementById('settings-email-pass').value = s.emailPasswordSet ? '••••••••' : '';
+    _emailDirty.setBaseline();
   }).catch(() => {});
   // Pre-fill workfolder path
   api('/api/settings/workfolder').then(r => {
@@ -1080,6 +1149,7 @@ document.getElementById('settings-save-btn').addEventListener('click', async () 
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+    _emailDirty.markClean();
     closeSettings();
   } catch (_) {}
 });
@@ -1120,6 +1190,13 @@ function tgSetStatus(id, msg, type = '') {
   el.className   = 'tg-status' + (type ? ' ' + type : '');
 }
 
+const _tgDirty = makeDirtyTracker(
+  document.getElementById('settings-tg-save-btn'),
+  [document.getElementById('settings-tg-chat'),
+   document.getElementById('settings-tg-enabled'),
+   document.getElementById('settings-tg-interval')]
+);
+
 async function loadTelegramSettings() {
   try {
     const s = await api('/api/telegram');
@@ -1141,6 +1218,7 @@ async function loadTelegramSettings() {
         // Fully configured — jump straight to step 4
         document.getElementById('tg-connected-channel-id').textContent = s.chatId;
         tgSetStep('connected');
+        _tgDirty.setBaseline();     // ← baseline set; Save stays grey until something changes
       } else {
         // Authorized but no channel selected yet — start at step 3
         tgSetStatus('settings-tg-status-channel', '');
@@ -1294,6 +1372,7 @@ document.getElementById('settings-tg-save-btn').addEventListener('click', async 
     });
     // Update channel display in case it changed
     document.getElementById('tg-connected-channel-id').textContent = chatId || '—';
+    _tgDirty.markClean();
     tgSetStatus('settings-tg-status-conn', '✓ Saved', 'ok');
     setTimeout(() => tgSetStatus('settings-tg-status-conn', ''), 2500);
   } catch (_) { tgSetStatus('settings-tg-status-conn', 'Save failed', 'err'); }
@@ -1317,6 +1396,411 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
     tgSetStep('credentials');
   } catch (_) {}
 });
+
+// ── iCloud Drive sync wizard ─────────────────────────────────────────────────
+(function () {
+  const IC_STEPS = ['locate', 'folder', 'connected'];
+
+  function icSetStep(step) {
+    IC_STEPS.forEach(s => {
+      document.getElementById(`icloud-step-${s}`).classList.toggle('hidden', s !== step);
+    });
+    const idx = IC_STEPS.indexOf(step);
+    IC_STEPS.forEach((s, i) => {
+      const dot  = document.querySelector(`.tg-wizard-dot[data-ic-step="${s}"]`);
+      const line = document.querySelector(`.tg-wizard-line[data-after="${s}"]`);
+      if (dot) {
+        dot.classList.toggle('active', i === idx);
+        dot.classList.toggle('done',   i < idx);
+      }
+      if (line) line.classList.toggle('done', i < idx);
+    });
+  }
+
+  function icStatus(id, msg, type = '') {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = msg;
+    el.className   = 'tg-status' + (type ? ' ' + type : '');
+  }
+
+  // Held between steps
+  let _icDrivePath = '';
+
+  const _icDirty = makeDirtyTracker(
+    document.getElementById('icloud-save-btn'),
+    [document.getElementById('icloud-enabled-chk'),
+     document.getElementById('icloud-interval-sel')]
+  );
+
+  async function loadIcloudSettings() {
+    try {
+      const s = await api('/api/icloud');
+      if (s.connected) {
+        _icDrivePath = s.drivePath;
+        document.getElementById('icloud-conn-drive').textContent    = s.drivePath;
+        document.getElementById('icloud-conn-folder').textContent   = s.folder;
+        document.getElementById('icloud-conn-lastsync').textContent = s.lastSyncStr;
+        document.getElementById('icloud-enabled-chk').checked       = s.enabled;
+        const ivSel = document.getElementById('icloud-interval-sel');
+        const iv    = String(s.syncInterval);
+        const opt   = [...ivSel.options].find(o => o.value === iv);
+        if (opt) ivSel.value = iv;
+        icSetStep('connected');
+        _icDirty.setBaseline();
+      } else {
+        // Pre-fill path if we have one saved (but not yet connected)
+        if (s.drivePath) document.getElementById('icloud-drive-path').value = s.drivePath;
+        icSetStep('locate');
+      }
+    } catch (_) { icSetStep('locate'); }
+  }
+
+  // Expose so activateSettingsPanel can call it
+  window.loadIcloudSettings = loadIcloudSettings;
+
+  // ── Step 1: Auto-detect ──────────────────────────────────────────────────
+  document.getElementById('icloud-detect-btn').addEventListener('click', async () => {
+    icStatus('icloud-status-locate', 'Searching…');
+    try {
+      const r = await api('/api/icloud/detect');
+      if (r.found) {
+        document.getElementById('icloud-drive-path').value = r.path;
+        icStatus('icloud-status-locate', `Found: ${r.path}`, 'ok');
+      } else {
+        icStatus('icloud-status-locate',
+          'Not found. Install iCloud for Windows and sign in, then try again.', 'err');
+      }
+    } catch (e) {
+      icStatus('icloud-status-locate', 'Detection failed: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 1: Browse ───────────────────────────────────────────────────────
+  document.getElementById('icloud-browse-btn').addEventListener('click', async () => {
+    try {
+      const picked = await window.pywebview?.api?.pick_folder?.();
+      if (picked) document.getElementById('icloud-drive-path').value = picked;
+    } catch (_) {
+      icStatus('icloud-status-locate', 'Browse requires the desktop app.', 'err');
+    }
+  });
+
+  // ── Step 1: Open Apple download page ────────────────────────────────────
+  document.getElementById('icloud-open-download').addEventListener('click', () => {
+    window.pywebview?.api?.open_url?.('https://updates.cdn-apple.com/2020/windows/001-39935-20200911-1A70AA56-F448-11EA-8CC0-99D41950005E/iCloudSetup.exe');
+  });
+
+  // ── Step 1: Next ─────────────────────────────────────────────────────────
+  document.getElementById('icloud-locate-next-btn').addEventListener('click', () => {
+    const path = document.getElementById('icloud-drive-path').value.trim();
+    if (!path) { icStatus('icloud-status-locate', 'Please enter or detect your iCloud Drive path.', 'err'); return; }
+    _icDrivePath = path;
+    // Update Step 2 preview labels
+    document.getElementById('icloud-tree-root-label').textContent =
+      `📁 ${path.split(/[\\/]/).pop() || path} /`;
+    const folderName = document.getElementById('icloud-folder-name').value.trim() || 'myNotes';
+    document.getElementById('icloud-folder-preview').textContent = folderName;
+    icStatus('icloud-status-locate', '');
+    icSetStep('folder');
+  });
+
+  // Update tree preview when folder name changes
+  document.getElementById('icloud-folder-name').addEventListener('input', function () {
+    document.getElementById('icloud-folder-preview').textContent = this.value.trim() || 'myNotes';
+  });
+
+  // ── Step 2: Back ─────────────────────────────────────────────────────────
+  document.getElementById('icloud-folder-back-btn').addEventListener('click', () => {
+    icStatus('icloud-status-folder', '');
+    icSetStep('locate');
+  });
+
+  // ── Step 2: Create & Connect ─────────────────────────────────────────────
+  document.getElementById('icloud-folder-create-btn').addEventListener('click', async () => {
+    const folder = document.getElementById('icloud-folder-name').value.trim() || 'myNotes';
+    icStatus('icloud-status-folder', 'Creating folders…');
+    try {
+      const r = await api('/api/icloud/setup', {
+        method: 'POST',
+        body: JSON.stringify({ drivePath: _icDrivePath, folder, syncInterval: 300 }),
+      });
+      if (r.ok) {
+        // Refresh and show connected step
+        await loadIcloudSettings();
+        // Trigger first sync in background
+        api('/api/icloud/sync', { method: 'POST' }).catch(() => {});
+      } else {
+        icStatus('icloud-status-folder', r.error || 'Setup failed.', 'err');
+      }
+    } catch (e) {
+      icStatus('icloud-status-folder', 'Error: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 3: Sync Now ─────────────────────────────────────────────────────
+  document.getElementById('icloud-sync-now-btn').addEventListener('click', async () => {
+    icStatus('icloud-status-conn', 'Syncing…');
+    try {
+      const r = await api('/api/icloud/sync', { method: 'POST' });
+      if (r.ok) {
+        const msg = `Done — ↑${r.toRemote} to iCloud, ↓${r.toLocal} to PC, ${r.skipped} unchanged`;
+        icStatus('icloud-status-conn', msg, 'ok');
+        document.getElementById('icloud-conn-lastsync').textContent =
+          new Date().toLocaleString();
+        setTimeout(() => icStatus('icloud-status-conn', ''), 4000);
+      } else {
+        icStatus('icloud-status-conn', r.error || 'Sync failed.', 'err');
+      }
+    } catch (e) {
+      icStatus('icloud-status-conn', 'Error: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 3: Save ─────────────────────────────────────────────────────────
+  document.getElementById('icloud-save-btn').addEventListener('click', async () => {
+    const enabled  = document.getElementById('icloud-enabled-chk').checked;
+    const interval = parseInt(document.getElementById('icloud-interval-sel').value, 10);
+    try {
+      const r = await api('/api/icloud', {
+        method: 'POST',
+        body: JSON.stringify({ enabled, syncInterval: interval }),
+      });
+      if (r.ok) {
+        _icDirty.markClean();
+        icStatus('icloud-status-conn', 'Saved.', 'ok');
+        setTimeout(() => icStatus('icloud-status-conn', ''), 2000);
+      } else {
+        icStatus('icloud-status-conn', 'Save failed.', 'err');
+      }
+    } catch (e) {
+      icStatus('icloud-status-conn', 'Error: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 3: Disconnect ───────────────────────────────────────────────────
+  document.getElementById('icloud-disconnect-btn').addEventListener('click', async () => {
+    if (!confirm('Disconnect iCloud Drive sync? Your existing notes are not deleted.')) return;
+    try {
+      await fetch('/api/icloud', { method: 'DELETE' });
+      _icDrivePath = '';
+      document.getElementById('icloud-drive-path').value = '';
+      icStatus('icloud-status-locate', '');
+      icSetStep('locate');
+    } catch (_) {}
+  });
+
+  // ── SSE: reflect live sync result in the UI ──────────────────────────────
+  document.addEventListener('sse-icloud_sync', e => {
+    const r = e.detail?.result;
+    if (!r) return;
+    document.getElementById('icloud-conn-lastsync').textContent =
+      new Date().toLocaleString();
+    const msg = `Auto-sync — ↑${r.toRemote} to iCloud, ↓${r.toLocal} to PC`;
+    icStatus('icloud-status-conn', msg, 'ok');
+    setTimeout(() => icStatus('icloud-status-conn', ''), 4000);
+  });
+})();
+
+// ── Android / Google Drive sync wizard ───────────────────────────────────────
+(function () {
+  const GD_STEPS = ['locate', 'folder', 'connected'];
+
+  function gdSetStep(step) {
+    GD_STEPS.forEach(s => {
+      document.getElementById(`android-step-${s}`).classList.toggle('hidden', s !== step);
+    });
+    const idx = GD_STEPS.indexOf(step);
+    GD_STEPS.forEach((s, i) => {
+      const dot  = document.querySelector(`.tg-wizard-dot[data-gd-step="${s}"]`);
+      const line = document.querySelector(`.tg-wizard-line[data-gd-after="${s}"]`);
+      if (dot) {
+        dot.classList.toggle('active', i === idx);
+        dot.classList.toggle('done',   i < idx);
+      }
+      if (line) line.classList.toggle('done', i < idx);
+    });
+  }
+
+  function gdStatus(id, msg, type = '') {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = msg;
+    el.className   = 'tg-status' + (type ? ' ' + type : '');
+  }
+
+  let _gdDrivePath = '';
+
+  const _gdDirty = makeDirtyTracker(
+    document.getElementById('android-save-btn'),
+    [document.getElementById('android-enabled-chk'),
+     document.getElementById('android-interval-sel')]
+  );
+
+  async function loadAndroidSettings() {
+    try {
+      const s = await api('/api/gdrive');
+      if (s.connected) {
+        _gdDrivePath = s.drivePath;
+        document.getElementById('android-conn-drive').textContent    = s.drivePath;
+        document.getElementById('android-conn-folder').textContent   = s.folder;
+        document.getElementById('android-conn-lastsync').textContent = s.lastSyncStr;
+        document.getElementById('android-enabled-chk').checked       = s.enabled;
+        const ivSel = document.getElementById('android-interval-sel');
+        const iv    = String(s.syncInterval);
+        const opt   = [...ivSel.options].find(o => o.value === iv);
+        if (opt) ivSel.value = iv;
+        gdSetStep('connected');
+        _gdDirty.setBaseline();
+      } else {
+        if (s.drivePath) document.getElementById('android-drive-path').value = s.drivePath;
+        gdSetStep('locate');
+      }
+    } catch (_) { gdSetStep('locate'); }
+  }
+
+  window.loadAndroidSettings = loadAndroidSettings;
+
+  // ── Step 1: Auto-detect ──────────────────────────────────────────────────
+  document.getElementById('android-detect-btn').addEventListener('click', async () => {
+    gdStatus('android-status-locate', 'Searching…');
+    try {
+      const r = await api('/api/gdrive/detect');
+      if (r.found) {
+        document.getElementById('android-drive-path').value = r.path;
+        gdStatus('android-status-locate', `Found: ${r.path}`, 'ok');
+      } else {
+        gdStatus('android-status-locate',
+          'Not found. Install Google Drive for Desktop, sign in, then try again.', 'err');
+      }
+    } catch (e) {
+      gdStatus('android-status-locate', 'Detection failed: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 1: Browse ───────────────────────────────────────────────────────
+  document.getElementById('android-browse-btn').addEventListener('click', async () => {
+    try {
+      const picked = await window.pywebview?.api?.pick_folder?.();
+      if (picked) document.getElementById('android-drive-path').value = picked;
+    } catch (_) {
+      gdStatus('android-status-locate', 'Browse requires the desktop app.', 'err');
+    }
+  });
+
+  // ── Step 1: Open Google Drive download page ──────────────────────────────
+  document.getElementById('android-open-download').addEventListener('click', () => {
+    window.pywebview?.api?.open_url?.(
+      'https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe');
+  });
+
+  // ── Step 1: Next ─────────────────────────────────────────────────────────
+  document.getElementById('android-locate-next-btn').addEventListener('click', () => {
+    const path = document.getElementById('android-drive-path').value.trim();
+    if (!path) { gdStatus('android-status-locate', 'Please enter or detect your Google Drive path.', 'err'); return; }
+    _gdDrivePath = path;
+    document.getElementById('android-tree-root-label').textContent =
+      `📁 ${path.split(/[\\/]/).pop() || path} /`;
+    const folderName = document.getElementById('android-folder-name').value.trim() || 'myNotes';
+    document.getElementById('android-folder-preview').textContent = folderName;
+    gdStatus('android-status-locate', '');
+    gdSetStep('folder');
+  });
+
+  // Update tree preview when folder name changes
+  document.getElementById('android-folder-name').addEventListener('input', function () {
+    document.getElementById('android-folder-preview').textContent = this.value.trim() || 'myNotes';
+  });
+
+  // ── Step 2: Back ─────────────────────────────────────────────────────────
+  document.getElementById('android-folder-back-btn').addEventListener('click', () => {
+    gdStatus('android-status-folder', '');
+    gdSetStep('locate');
+  });
+
+  // ── Step 2: Create & Connect ─────────────────────────────────────────────
+  document.getElementById('android-folder-create-btn').addEventListener('click', async () => {
+    const folder = document.getElementById('android-folder-name').value.trim() || 'myNotes';
+    gdStatus('android-status-folder', 'Creating folders…');
+    try {
+      const r = await api('/api/gdrive/setup', {
+        method: 'POST',
+        body: JSON.stringify({ drivePath: _gdDrivePath, folder, syncInterval: 300 }),
+      });
+      if (r.ok) {
+        await loadAndroidSettings();
+        api('/api/gdrive/sync', { method: 'POST' }).catch(() => {});
+      } else {
+        gdStatus('android-status-folder', r.error || 'Setup failed.', 'err');
+      }
+    } catch (e) {
+      gdStatus('android-status-folder', 'Error: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 3: Sync Now ─────────────────────────────────────────────────────
+  document.getElementById('android-sync-now-btn').addEventListener('click', async () => {
+    gdStatus('android-status-conn', 'Syncing…');
+    try {
+      const r = await api('/api/gdrive/sync', { method: 'POST' });
+      if (r.ok) {
+        const msg = `Done — ↑${r.toRemote} to Drive, ↓${r.toLocal} to PC, ${r.skipped} unchanged`;
+        gdStatus('android-status-conn', msg, 'ok');
+        document.getElementById('android-conn-lastsync').textContent =
+          new Date().toLocaleString();
+        setTimeout(() => gdStatus('android-status-conn', ''), 4000);
+      } else {
+        gdStatus('android-status-conn', r.error || 'Sync failed.', 'err');
+      }
+    } catch (e) {
+      gdStatus('android-status-conn', 'Error: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 3: Save ─────────────────────────────────────────────────────────
+  document.getElementById('android-save-btn').addEventListener('click', async () => {
+    const enabled  = document.getElementById('android-enabled-chk').checked;
+    const interval = parseInt(document.getElementById('android-interval-sel').value, 10);
+    try {
+      const r = await api('/api/gdrive', {
+        method: 'POST',
+        body: JSON.stringify({ enabled, syncInterval: interval }),
+      });
+      if (r.ok) {
+        _gdDirty.markClean();
+        gdStatus('android-status-conn', 'Saved.', 'ok');
+        setTimeout(() => gdStatus('android-status-conn', ''), 2000);
+      } else {
+        gdStatus('android-status-conn', 'Save failed.', 'err');
+      }
+    } catch (e) {
+      gdStatus('android-status-conn', 'Error: ' + e.message, 'err');
+    }
+  });
+
+  // ── Step 3: Disconnect ───────────────────────────────────────────────────
+  document.getElementById('android-disconnect-btn').addEventListener('click', async () => {
+    if (!confirm('Disconnect Google Drive sync? Your existing notes are not deleted.')) return;
+    try {
+      await fetch('/api/gdrive', { method: 'DELETE' });
+      _gdDrivePath = '';
+      document.getElementById('android-drive-path').value = '';
+      gdStatus('android-status-locate', '');
+      gdSetStep('locate');
+    } catch (_) {}
+  });
+
+  // ── SSE: reflect live sync result in the UI ──────────────────────────────
+  document.addEventListener('sse-gdrive_sync', e => {
+    const r = e.detail?.result;
+    if (!r) return;
+    document.getElementById('android-conn-lastsync').textContent =
+      new Date().toLocaleString();
+    const msg = `Auto-sync — ↑${r.toRemote} to Drive, ↓${r.toLocal} to PC`;
+    gdStatus('android-status-conn', msg, 'ok');
+    setTimeout(() => gdStatus('android-status-conn', ''), 4000);
+  });
+})();
 
 // ── Browser password import ─────────────────────────────────────────────────
 
@@ -1965,6 +2449,231 @@ function _handleNotesUpdated(ev) {
   _applyNotesUpdate(ev);
 }
 
+// ── Manage Space ─────────────────────────────────────────────────────────────
+(function () {
+  // Colours and icons matching the backend categories
+  const CAT_ICONS = {
+    notes:     '📝',
+    images:    '🖼',
+    documents: '📄',
+    videos:    '🎬',
+    audio:     '🎵',
+    archives:  '🗜',
+  };
+
+  function fmtBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B','KB','MB','GB','TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const v = bytes / Math.pow(1024, i);
+    return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
+  }
+
+  async function loadStorage() {
+    const loading = document.getElementById('storage-loading');
+    const content = document.getElementById('storage-content');
+    const refreshBtn = document.getElementById('storage-refresh-btn');
+    loading.classList.remove('hidden');
+    content.classList.add('hidden');
+    refreshBtn.classList.add('spinning');
+
+    let data;
+    try {
+      data = await api('/api/storage');
+    } catch (e) {
+      loading.innerHTML = `<span style="color:var(--danger)">Error: ${e.message}</span>`;
+      refreshBtn.classList.remove('spinning');
+      return;
+    }
+
+    loading.classList.add('hidden');
+
+    const total = data.total;
+    // Backend already returns sorted desc; also sort client-side for safety
+    const cats  = [...data.categories]
+      .sort((a, b) => b.size - a.size)
+      .filter(c => c.size > 0);
+
+    // ── Stacked bar (largest → smallest, left → right) ─────────────────────
+    const bar = document.getElementById('storage-bar');
+    bar.innerHTML = '';
+    cats.forEach(c => {
+      const pct = total > 0 ? (c.size / total * 100) : 0;
+      const seg = document.createElement('div');
+      seg.className = 'storage-bar-seg';
+      seg.style.cssText = `width:${Math.max(pct, 0.4)}%;background:${c.color}`;
+      seg.title = `${c.label}: ${fmtBytes(c.size)}`;
+      bar.appendChild(seg);
+    });
+
+    // ── Legend ─────────────────────────────────────────────────────────────
+    const legend = document.getElementById('storage-legend');
+    legend.innerHTML = '';
+    cats.forEach(c => {
+      const dot = document.createElement('span');
+      dot.className = 'storage-legend-item';
+      dot.innerHTML =
+        `<span class="storage-legend-dot" style="background:${c.color}"></span>${c.label}`;
+      legend.appendChild(dot);
+    });
+
+    // ── Total ──────────────────────────────────────────────────────────────
+    document.getElementById('storage-total-val').textContent = fmtBytes(total);
+
+    // ── Category rows ──────────────────────────────────────────────────────
+    const rows = document.getElementById('storage-rows');
+    rows.innerHTML = '';
+
+    // Rows: ALL categories, sorted largest → smallest (0-byte last)
+    const sortedCats = [...data.categories].sort((a, b) => b.size - a.size);
+    sortedCats.forEach(c => {
+      const pct = total > 0 ? (c.size / total * 100) : 0;
+      const row = document.createElement('div');
+      row.className = 'storage-row';
+
+      row.innerHTML = `
+        <div class="storage-row-left">
+          <span class="storage-row-icon">${CAT_ICONS[c.key] || '📁'}</span>
+          <span class="storage-row-label">${c.label}</span>
+          <span class="storage-row-count">${c.count} file${c.count !== 1 ? 's' : ''}</span>
+        </div>
+        <div class="storage-row-right">
+          <span class="storage-row-size">${fmtBytes(c.size)}</span>
+          <div class="storage-row-bar">
+            <div class="storage-row-fill"
+                 style="width:${Math.max(pct,0)}%;background:${c.color}"></div>
+          </div>
+        </div>`;
+
+      // Tooltip — top 3 entries only
+      if (c.top && c.top.length > 0) {
+        const tip = document.createElement('div');
+        tip.className = 'storage-tooltip hidden';
+
+        let tipHtml;
+        if (c.key === 'notes') {
+          // Notes: show note title + size breakdown
+          tipHtml = `<div class="storage-tip-header">Largest notes
+              <span class="storage-tip-sub">(note + linked attachments)</span></div>`
+            + c.top.map(t =>
+                `<div class="storage-tip-row">
+                  <span class="storage-tip-name" title="${t.name}">${t.name}</span>
+                  <span class="storage-tip-meta">${t.detail}</span>
+                 </div>`).join('');
+        } else {
+          // Attachments: show filename + which note uses it
+          tipHtml = `<div class="storage-tip-header">Largest files</div>`
+            + c.top.map(t => {
+                const noteInfo = t.noteTitle
+                  ? `<span class="storage-tip-note" title="${t.noteTitle}">📝 ${t.noteTitle}</span>`
+                  : '';
+                return `<div class="storage-tip-row storage-tip-row--attach">
+                  <div class="storage-tip-attach-names">
+                    <span class="storage-tip-name" title="${t.name}">${t.name}</span>
+                    ${noteInfo}
+                  </div>
+                  <span class="storage-tip-meta">${t.detail}</span>
+                 </div>`;
+              }).join('');
+        }
+
+        tip.innerHTML = tipHtml;
+        row.appendChild(tip);
+
+        row.addEventListener('mouseenter', () => tip.classList.remove('hidden'));
+        row.addEventListener('mouseleave', () => tip.classList.add('hidden'));
+      }
+
+      rows.appendChild(row);
+    });
+
+    refreshBtn.classList.remove('spinning');
+    content.classList.remove('hidden');
+  }
+
+  window.loadStorageSettings = loadStorage;
+
+  document.getElementById('storage-refresh-btn')
+    .addEventListener('click', loadStorage);
+})();
+
+/* ── Trash settings panel ─────────────────────────────────────────────────── */
+(function () {
+  const sel     = document.getElementById('trash-expire-select');
+  const saveBtn = document.getElementById('trash-save-btn');
+  const status  = document.getElementById('trash-settings-status');
+  const emptyBtn  = document.getElementById('trash-empty-btn');
+  const overlay   = document.getElementById('trash-confirm-overlay');
+  const cancelBtn = document.getElementById('trash-confirm-cancel');
+  const okBtn     = document.getElementById('trash-confirm-ok');
+
+  const _trashDirty = makeDirtyTracker(saveBtn, [sel]);
+
+  // Load current setting from server; set baseline so Save stays grey
+  async function loadTrashSettings() {
+    try {
+      const data = await api('/api/trash/settings');
+      sel.value = String(data.expireMonths || 3);
+      _trashDirty.setBaseline();
+    } catch { /* silent */ }
+  }
+
+  // Save expiry period
+  saveBtn.addEventListener('click', async () => {
+    saveBtn.disabled = true;
+    try {
+      await api('/api/trash/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expireMonths: parseInt(sel.value, 10) })
+      });
+      _trashDirty.markClean();      // back to grey — nothing "new" to save
+      status.textContent = 'Saved';
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    } catch {
+      status.textContent = 'Error saving';
+      saveBtn.disabled = false;     // re-enable so user can retry
+    }
+  });
+
+  // Empty Trash → show confirm dialog
+  emptyBtn.addEventListener('click', () => {
+    overlay.classList.remove('hidden');
+  });
+
+  // Cancel — close dialog
+  cancelBtn.addEventListener('click', () => {
+    overlay.classList.add('hidden');
+  });
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) overlay.classList.add('hidden');
+  });
+
+  // OK — permanently delete all trash
+  okBtn.addEventListener('click', async () => {
+    overlay.classList.add('hidden');
+    okBtn.disabled = true;
+    emptyBtn.disabled = true;
+    status.textContent = 'Emptying…';
+    try {
+      const data = await api('/api/trash/empty', { method: 'POST' });
+      status.textContent = data.deleted
+        ? `Deleted ${data.deleted} note${data.deleted !== 1 ? 's' : ''}`
+        : 'Trash already empty';
+      setTimeout(() => { status.textContent = ''; }, 3000);
+      // Refresh note list if any notes were removed
+      if (data.deleted) refreshNoteList();
+    } catch {
+      status.textContent = 'Error';
+    } finally {
+      okBtn.disabled = false;
+      emptyBtn.disabled = false;
+    }
+  });
+
+  window.loadTrashSettings = loadTrashSettings;
+})();
+
 (function connectSSE() {
   const src = new EventSource('/api/events');
 
@@ -1976,6 +2685,10 @@ function _handleNotesUpdated(ev) {
       _handleNotesUpdated(ev);
     } else if (ev.type === 'notify') {
       showNotif(ev.msg, ev.level || 'warn');
+    } else if (ev.type === 'icloud_sync') {
+      document.dispatchEvent(new CustomEvent('sse-icloud_sync', { detail: ev }));
+    } else if (ev.type === 'gdrive_sync') {
+      document.dispatchEvent(new CustomEvent('sse-gdrive_sync', { detail: ev }));
     }
   };
 

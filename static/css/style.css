@@ -324,29 +324,31 @@ html.webview-app .app          { height: calc(100vh - 32px); }
 /* Handle-2 stays lit while editing */
 body.editing-active #handle-2 { background: color-mix(in srgb, var(--accent) 60%, transparent); }
 
-/* ── Theme toggle (in toolbar) ────────────────────────────────────────────── */
+/* ── Theme toggle — absolute, mirrors .dialog-close-btn on the left ─────── */
 
 #theme-toggle {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  width: 26px;
+  height: 26px;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
   background: transparent;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   color: var(--text-muted);
   cursor: pointer;
-  flex-shrink: 0;
-  transition: color 0.15s, background 0.15s;
+  z-index: 10;
+  transition: color 0.1s, background 0.1s;
 }
-
-#theme-toggle:hover { color: var(--accent); background: var(--bg-raised); }
+#theme-toggle:hover { color: var(--text-primary); background: var(--bg-surface); }
 #theme-toggle svg   { width: 13px; height: 13px; }
 
 [data-theme="dark"]  #theme-toggle .icon-moon { display: none; }
 [data-theme="light"] #theme-toggle .icon-sun  { display: none; }
+
 
 /* ── Drag handles ─────────────────────────────────────────────────────────── */
 
@@ -405,7 +407,7 @@ body.dragging .col-handle { background: var(--accent); }
   opacity: 0.7;
 }
 [data-theme="light"] .tag-item[data-tag="trash"].tag-system {
-  color: #b83232;
+  color: var(--accent);
 }
 .tag-item[data-tag="trash"].tag-system:hover { opacity: 1; }
 
@@ -416,8 +418,8 @@ body.dragging .col-handle { background: var(--accent); }
 }
 
 [data-theme="light"] .tag-item[data-tag="trash"].active {
-  background: #fde8e8;
-  color: #b83232;
+  background: var(--accent-subtle);
+  color: var(--accent);
 }
 
 /* Flash animation when user tries to create a reserved tag */
@@ -584,6 +586,49 @@ body.dragging .col-handle { background: var(--accent); }
   padding: 14px 18px;
   overflow-x: auto;
   margin: 0 0 1em;
+  position: relative;
+}
+
+.code-copy-btn {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-family: system-ui, sans-serif;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 5px;
+  color: rgba(255,255,255,0.5);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s, border-color 0.15s;
+  line-height: 1.5;
+  user-select: none;
+}
+.note-view pre:hover .code-copy-btn { opacity: 1; }
+.code-copy-btn:hover {
+  background: rgba(255,255,255,0.14);
+  color: rgba(255,255,255,0.88);
+}
+.code-copy-btn.copied {
+  opacity: 1 !important;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+[data-theme="light"] .code-copy-btn {
+  background: rgba(0,0,0,0.04);
+  border-color: rgba(0,0,0,0.1);
+  color: rgba(0,0,0,0.4);
+}
+[data-theme="light"] .code-copy-btn:hover {
+  background: rgba(0,0,0,0.08);
+  color: rgba(0,0,0,0.75);
+}
+[data-theme="light"] .code-copy-btn.copied {
+  opacity: 1 !important;
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .note-view pre code {
@@ -1181,9 +1226,10 @@ body.dragging .col-handle { background: var(--accent); }
 .settings-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 8px;
-  margin-top: auto;
-  padding-top: 8px;
+  /* No margin-top: auto — that causes layout drift in flex columns.
+     Spacing comes from the parent panel's gap: 16px. */
 }
 
 /* ── Shared dialog buttons ────────────────────────────────────────────────── */
@@ -1194,7 +1240,8 @@ body.dragging .col-handle { background: var(--accent); }
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  border: none;
+  /* Always keep a 1px border so enabled↔disabled never shifts layout */
+  border: 1px solid transparent;
   transition: opacity 0.15s, background 0.15s;
 }
 
@@ -1209,7 +1256,7 @@ body.dragging .col-handle { background: var(--accent); }
 .btn-secondary:disabled {
   background: var(--bg-surface);
   color: var(--text-muted);
-  border: 1px solid var(--border);
+  border-color: var(--border);   /* only colour changes — no size change */
   opacity: 0.5;
   cursor: not-allowed;
   pointer-events: none;
@@ -1218,7 +1265,7 @@ body.dragging .col-handle { background: var(--accent); }
 .btn-secondary {
   background: var(--bg-surface);
   color: var(--text-muted);
-  border: 1px solid var(--border);
+  border-color: var(--border);
 }
 
 .btn-secondary:hover { color: var(--text-primary); background: var(--bg-raised); }
@@ -1731,3 +1778,361 @@ body.dragging .col-handle { background: var(--accent); }
 .tg-dialog-item:hover {
   background: var(--accent-subtle);
 }
+
+/* ── iCloud Drive wizard ─────────────────────────────────────────────────── */
+
+/* Folder tree preview in Step 2 */
+.icloud-tree {
+  margin: 10px 0 6px 0;
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.icloud-tree-root   { color: var(--text-muted); }
+.icloud-tree-branch {
+  padding-left: 20px;
+  color: var(--text);
+}
+.icloud-tree-sub {
+  padding-left: 22px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Truncate long drive paths gracefully in the connected info table */
+.icloud-path-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 280px;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* Browse + detect side-by-side in one row */
+#settings-panel-icloud .notable-path-row {
+  display: flex;
+  gap: 6px;
+}
+#settings-panel-icloud .notable-path-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Light-theme overrides */
+body.light .icloud-tree {
+  background: var(--bg-surface);
+  border-color: var(--border);
+}
+
+/* ── Manage Space panel ──────────────────────────────────────────────────── */
+
+/* Refresh button — absolute, same height as close button, one step to its left */
+.storage-refresh-icon {
+  position: absolute;
+  top: 8px;
+  right: 44px;            /* 10px gap + 26px close btn + 8px gap */
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+  z-index: 10;
+  transition: color 0.1s, background 0.1s, transform 0.3s;
+}
+.storage-refresh-icon:hover { color: var(--text-primary); background: var(--bg-surface); }
+.storage-refresh-icon.spinning { animation: spin 0.6s linear infinite; }
+
+/* Loading spinner */
+.storage-spinner-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 24px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.storage-spinner {
+  width: 18px; height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Stacked colour bar */
+.storage-bar {
+  display: flex;
+  height: 14px;
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--bg-surface);
+  margin-bottom: 10px;
+  gap: 1px;
+}
+.storage-bar-seg {
+  height: 100%;
+  min-width: 3px;
+  transition: opacity 0.15s;
+}
+.storage-bar-seg:first-child { border-radius: 7px 0 0 7px; }
+.storage-bar-seg:last-child  { border-radius: 0 7px 7px 0; }
+.storage-bar-seg:only-child  { border-radius: 7px; }
+
+/* Legend */
+.storage-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-bottom: 14px;
+}
+.storage-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.storage-legend-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Total row */
+.storage-total-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 6px 0 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.storage-total-label { font-size: 12px; color: var(--text-muted); }
+.storage-total-val   { font-size: 14px; font-weight: 600; color: var(--text); }
+
+/* Category rows */
+.storage-rows { display: flex; flex-direction: column; }
+
+.storage-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 6px;
+  border-radius: 6px;
+  cursor: default;
+  transition: background 0.12s;
+}
+.storage-row:hover { background: var(--accent-subtle); }
+
+.storage-row-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.storage-row-icon  { font-size: 16px; flex-shrink: 0; }
+.storage-row-label { font-size: 13px; font-weight: 500; color: var(--text); white-space: nowrap; }
+.storage-row-count { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+
+.storage-row-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.storage-row-size {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  min-width: 58px;
+  text-align: right;
+  white-space: nowrap;
+}
+.storage-row-bar {
+  width: 80px;
+  height: 5px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.storage-row-fill { height: 100%; border-radius: 3px; transition: width 0.4s; }
+
+/* Tooltip */
+.storage-tooltip {
+  position: absolute;
+  left: 0; right: 0;
+  top: calc(100% + 2px);
+  z-index: 120;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+  min-width: 260px;
+  pointer-events: none;
+}
+.storage-tip-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 7px;
+}
+.storage-tip-sub { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.storage-tip-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 2px 0;
+  font-size: 12px;
+}
+.storage-tip-name {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+  flex: 1;
+}
+.storage-tip-meta {
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+/* Warning text */
+.storage-warn {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  margin-top: 12px;
+  line-height: 1.5;
+}
+
+/* Attachment tooltip rows: filename + note-name stacked */
+.storage-tip-row--attach { align-items: flex-start; }
+.storage-tip-attach-names {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+.storage-tip-note {
+  font-size: 10px;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* light theme */
+[data-theme="light"] .storage-bar { background: #e8e8e8; }
+
+/* ── Trash settings panel ──────────────────────────────────────────────────── */
+
+.settings-select {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s;
+  flex: 1;
+}
+.settings-select:focus { border-color: var(--accent); }
+
+.trash-settings-status {
+  font-size: 11px;
+  color: var(--accent);
+  margin-right: auto;
+  align-self: center;
+}
+
+.trash-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 20px 0;
+}
+
+.trash-empty-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.trash-empty-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 3px;
+}
+
+.trash-empty-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.btn-danger {
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: #ff3b30;
+  color: #fff;
+  transition: opacity 0.15s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.btn-danger:hover:not(:disabled) { opacity: 0.82; }
+.btn-danger:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+
+/* Confirmation dialog tweaks */
+.trash-confirm-box {
+  max-width: 320px;
+  text-align: center;
+}
+.trash-confirm-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0 0 10px;
+}
+.trash-confirm-msg {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.55;
+  margin: 0 0 20px;
+}
+/* Cancel is green, OK is red */
+.trash-confirm-cancel {
+  background: #30d158 !important;
+  color: #fff !important;
+}
+.trash-confirm-cancel:hover { opacity: 0.85; }
+

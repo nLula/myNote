@@ -97,22 +97,6 @@
         </div>
 
         <div class="toolbar-right">
-          <button id="theme-toggle" aria-label="Toggle theme" title="Toggle light / dark mode">
-            <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="5"/>
-              <line x1="12" y1="1"  x2="12" y2="3"/>  <line x1="12" y1="21" x2="12" y2="23"/>
-              <line x1="4.22" y1="4.22"  x2="5.64" y2="5.64"/>
-              <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
-              <line x1="1"  y1="12" x2="3"  y2="12"/>  <line x1="21" y1="12" x2="23" y2="12"/>
-              <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
-              <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-            </svg>
-            <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-            </svg>
-          </button>
           <button id="btn-settings" aria-label="Settings" title="Settings">
             <img src="{{ url_for('static', filename='images/gear.png') }}" alt="Settings" />
           </button>
@@ -142,15 +126,37 @@
   <div id="settings-modal" class="modal-overlay hidden">
     <div class="settings-dialog">
       <button class="dialog-close-btn" id="settings-close" title="Close">×</button>
+      <button id="storage-refresh-btn" class="storage-refresh-icon" title="Refresh" style="display:none">↺</button>
+      <button id="theme-toggle" class="settings-nav-theme-btn" title="Toggle light / dark mode">
+        <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="5"/>
+          <line x1="12" y1="1"  x2="12" y2="3"/>  <line x1="12" y1="21" x2="12" y2="23"/>
+          <line x1="4.22" y1="4.22"  x2="5.64" y2="5.64"/>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="1"  y1="12" x2="3"  y2="12"/>  <line x1="21" y1="12" x2="23" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+        <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
       <div class="settings-left-panel">
         <div class="settings-nav">
           <div class="settings-nav-item active" data-panel="workfolder">myNotes folder</div>
           <div class="settings-nav-divider"></div>
           <div class="settings-nav-item" data-panel="email">Email</div>
-          <div class="settings-nav-item" data-panel="telegram">Telegram</div>
+          <div class="settings-nav-item" data-panel="telegram">Connect Telegram</div>
+          <div class="settings-nav-item" data-panel="icloud">Connect iPhone</div>
+          <div class="settings-nav-item" data-panel="android">Connect Android</div>
           <div class="settings-nav-item" data-panel="locked">Locked Notes</div>
           <div class="settings-nav-item" data-panel="passwords">Import passwords</div>
           <div class="settings-nav-item" data-panel="notable">Import Notable</div>
+          <div class="settings-nav-item" data-panel="trash">Trash</div>
+          <div class="settings-nav-divider"></div>
+          <div class="settings-nav-item" data-panel="storage">Manage Space</div>
         </div>
       </div>
       <div class="settings-right-panel">
@@ -316,7 +322,7 @@
               <div class="tg-info-row">
                 <span class="tg-info-label">Account</span>
                 <span id="tg-connected-name" class="tg-info-value">—</span>
-                <button class="btn-secondary" id="settings-tg-logout-btn">Log out</button>
+                <button class="btn-secondary" id="settings-tg-logout-btn">Disconnect</button>
               </div>
               <div class="tg-info-row">
                 <span class="tg-info-label">Channel</span>
@@ -346,6 +352,244 @@
             </div>
           </div>
         </div>
+        <!-- ══════════════════════════════════════════════════════════════════ -->
+        <!--  iCloud Drive sync wizard                                        -->
+        <!-- ══════════════════════════════════════════════════════════════════ -->
+        <div id="settings-panel-icloud" class="settings-panel">
+          <h3 class="settings-panel-title">Connect iPhone via iCloud Drive</h3>
+
+          <!-- Wizard progress dots -->
+          <div class="tg-wizard-steps">
+            <div class="tg-wizard-dot active" data-ic-step="locate">1</div>
+            <div class="tg-wizard-line"        data-after="locate"></div>
+            <div class="tg-wizard-dot"         data-ic-step="folder">2</div>
+            <div class="tg-wizard-line"        data-after="folder"></div>
+            <div class="tg-wizard-dot"         data-ic-step="connected">3</div>
+          </div>
+
+          <!-- ── Step 1: Locate iCloud Drive ─────────────────────────────── -->
+          <div id="icloud-step-locate">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 1 of 3 — Locate iCloud Drive</span>
+            </div>
+            <div class="tg-guide">
+              <p>myNote syncs notes and attachments via the <strong>iCloud Drive</strong> folder on your PC. This requires <strong>iCloud for Windows</strong> to be installed and signed in with your Apple ID.</p>
+              <ol class="tg-guide-steps">
+                <li>Download and install <strong>iCloud for Windows</strong> — <button class="tg-open-link" id="icloud-open-download">Download iCloudSetup.exe ↗</button></li>
+                <li>Sign in with your Apple ID, enable <strong>iCloud Drive</strong></li>
+                <li>Click <strong>Auto-detect</strong> below — the app will find the folder automatically</li>
+              </ol>
+              <p class="tg-guide-note">iCloud for Windows mounts your iCloud Drive as a local folder. myNote reads and writes notes there; iCloud syncs them to all your Apple devices automatically.</p>
+            </div>
+            <div class="settings-field">
+              <label for="icloud-drive-path">iCloud Drive folder path</label>
+              <div class="notable-path-row">
+                <input type="text" id="icloud-drive-path"
+                       placeholder="e.g. C:\Users\you\iCloudDrive"
+                       autocomplete="off" spellcheck="false" />
+                <button class="btn-secondary" id="icloud-detect-btn">Auto-detect</button>
+                <button class="btn-secondary" id="icloud-browse-btn">Browse…</button>
+              </div>
+            </div>
+            <div class="settings-actions">
+              <span id="icloud-status-locate" class="tg-status"></span>
+              <button class="btn-primary" id="icloud-locate-next-btn">Next →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 2: Create myNotes folder ────────────────────────────── -->
+          <div id="icloud-step-folder" class="hidden">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 2 of 3 — Create Sync Folder</span>
+            </div>
+            <div class="tg-guide">
+              <p>myNote will create the following folder structure inside your iCloud Drive:</p>
+              <div class="icloud-tree">
+                <div class="icloud-tree-root" id="icloud-tree-root-label">📁 iCloudDrive /</div>
+                <div class="icloud-tree-branch">
+                  📂 <strong id="icloud-folder-preview">myNotes</strong> /
+                  <div class="icloud-tree-sub">📁 notes &nbsp;&nbsp; <span class="tg-guide-note">— your .md files</span></div>
+                  <div class="icloud-tree-sub">📁 attachments &nbsp;&nbsp; <span class="tg-guide-note">— images, documents, videos</span></div>
+                </div>
+              </div>
+              <p class="tg-guide-note" style="margin-top:10px">On your iPhone you can access these files via the <strong>Files</strong> app → iCloud Drive → <em>myNotes</em>.</p>
+            </div>
+            <div class="settings-field">
+              <label for="icloud-folder-name">Sync folder name in iCloud Drive</label>
+              <input type="text" id="icloud-folder-name" value="myNotes"
+                     autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="settings-actions">
+              <span id="icloud-status-folder" class="tg-status"></span>
+              <button class="btn-secondary" id="icloud-folder-back-btn">← Back</button>
+              <button class="btn-primary"   id="icloud-folder-create-btn">Create &amp; Connect →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 3: Connected ─────────────────────────────────────────── -->
+          <div id="icloud-step-connected" class="hidden">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 3 of 3 — Connected</span>
+            </div>
+            <div class="tg-info-table">
+              <div class="tg-info-row">
+                <span class="tg-info-label">iCloud Drive</span>
+                <span id="icloud-conn-drive"  class="tg-info-value icloud-path-value">—</span>
+              </div>
+              <div class="tg-info-row">
+                <span class="tg-info-label">Sync folder</span>
+                <span id="icloud-conn-folder" class="tg-info-value">—</span>
+              </div>
+              <div class="tg-info-row">
+                <span class="tg-info-label">Last sync</span>
+                <span id="icloud-conn-lastsync" class="tg-info-value">—</span>
+              </div>
+            </div>
+
+            <div class="settings-field-row" style="margin-top:14px">
+              <label class="settings-toggle-label">
+                <input type="checkbox" id="icloud-enabled-chk" />
+                <span>Auto-sync every</span>
+                <select id="icloud-interval-sel" class="tg-interval-select">
+                  <option value="60"   >1 min</option>
+                  <option value="300"  selected>5 min</option>
+                  <option value="600"  >10 min</option>
+                  <option value="900"  >15 min</option>
+                  <option value="1800" >30 min</option>
+                  <option value="3600" >1 h</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="settings-actions" style="margin-top:8px">
+              <span id="icloud-status-conn" class="tg-status"></span>
+              <button class="btn-secondary" id="icloud-sync-now-btn">Sync Now</button>
+              <button class="btn-secondary" id="icloud-disconnect-btn">Disconnect</button>
+              <button class="btn-primary"   id="icloud-save-btn">Save</button>
+            </div>
+          </div>
+
+        </div><!-- /settings-panel-icloud -->
+
+        <!-- ══════════════════════════════════════════════════════════════════ -->
+        <!--  Android / Google Drive sync wizard                               -->
+        <!-- ══════════════════════════════════════════════════════════════════ -->
+        <div id="settings-panel-android" class="settings-panel">
+          <h3 class="settings-panel-title">Connect Android via Google Drive</h3>
+
+          <!-- Wizard progress dots -->
+          <div class="tg-wizard-steps">
+            <div class="tg-wizard-dot active" data-gd-step="locate">1</div>
+            <div class="tg-wizard-line"       data-gd-after="locate"></div>
+            <div class="tg-wizard-dot"        data-gd-step="folder">2</div>
+            <div class="tg-wizard-line"       data-gd-after="folder"></div>
+            <div class="tg-wizard-dot"        data-gd-step="connected">3</div>
+          </div>
+
+          <!-- ── Step 1: Locate Google Drive ──────────────────────────────── -->
+          <div id="android-step-locate">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 1 of 3 — Locate Google Drive</span>
+            </div>
+            <div class="tg-guide">
+              <p>myNote syncs notes and attachments via the <strong>Google Drive</strong> folder on your PC. This requires <strong>Google Drive for Desktop</strong> to be installed and signed in with your Google account.</p>
+              <ol class="tg-guide-steps">
+                <li>Download and install <strong>Google Drive for Desktop</strong> — <button class="tg-open-link" id="android-open-download">Download Google Drive for Desktop ↗</button></li>
+                <li>Sign in with your Google account, choose <strong>Mirror files</strong> (so files are available offline)</li>
+                <li>Click <strong>Auto-detect</strong> below — the app will find the folder automatically</li>
+              </ol>
+              <p class="tg-guide-note">Google Drive for Desktop maps your Google Drive as a local folder or virtual drive letter (e.g. <em>G:\My Drive</em>). myNote reads and writes notes there; Google Drive syncs them to all your Android devices automatically via the <strong>Google Drive</strong> or <strong>Files</strong> app.</p>
+            </div>
+            <div class="settings-field">
+              <label for="android-drive-path">Google Drive folder path</label>
+              <div class="notable-path-row">
+                <input type="text" id="android-drive-path"
+                       placeholder="e.g. G:\My Drive  or  C:\Users\you\Google Drive"
+                       autocomplete="off" spellcheck="false" />
+                <button class="btn-secondary" id="android-detect-btn">Auto-detect</button>
+                <button class="btn-secondary" id="android-browse-btn">Browse…</button>
+              </div>
+            </div>
+            <div class="settings-actions">
+              <span id="android-status-locate" class="tg-status"></span>
+              <button class="btn-primary" id="android-locate-next-btn">Next →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 2: Create myNotes folder ────────────────────────────── -->
+          <div id="android-step-folder" class="hidden">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 2 of 3 — Create Sync Folder</span>
+            </div>
+            <div class="tg-guide">
+              <p>myNote will create the following folder structure inside your Google Drive:</p>
+              <div class="icloud-tree">
+                <div class="icloud-tree-root" id="android-tree-root-label">📁 Google Drive /</div>
+                <div class="icloud-tree-branch">
+                  📂 <strong id="android-folder-preview">myNotes</strong> /
+                  <div class="icloud-tree-sub">📁 notes &nbsp;&nbsp; <span class="tg-guide-note">— your .md files</span></div>
+                  <div class="icloud-tree-sub">📁 attachments &nbsp;&nbsp; <span class="tg-guide-note">— images, documents, videos</span></div>
+                </div>
+              </div>
+              <p class="tg-guide-note" style="margin-top:10px">On your Android phone you can access these files via the <strong>Google Drive</strong> app → My Drive → <em>myNotes</em>, or via any file manager that supports Google Drive.</p>
+            </div>
+            <div class="settings-field">
+              <label for="android-folder-name">Sync folder name in Google Drive</label>
+              <input type="text" id="android-folder-name" value="myNotes"
+                     autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="settings-actions">
+              <span id="android-status-folder" class="tg-status"></span>
+              <button class="btn-secondary" id="android-folder-back-btn">← Back</button>
+              <button class="btn-primary"   id="android-folder-create-btn">Create &amp; Connect →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 3: Connected ─────────────────────────────────────────── -->
+          <div id="android-step-connected" class="hidden">
+            <div class="tg-step-header">
+              <span class="tg-step-label">Step 3 of 3 — Connected</span>
+            </div>
+            <div class="tg-info-table">
+              <div class="tg-info-row">
+                <span class="tg-info-label">Google Drive</span>
+                <span id="android-conn-drive"    class="tg-info-value icloud-path-value">—</span>
+              </div>
+              <div class="tg-info-row">
+                <span class="tg-info-label">Sync folder</span>
+                <span id="android-conn-folder"   class="tg-info-value">—</span>
+              </div>
+              <div class="tg-info-row">
+                <span class="tg-info-label">Last sync</span>
+                <span id="android-conn-lastsync" class="tg-info-value">—</span>
+              </div>
+            </div>
+
+            <div class="settings-field-row" style="margin-top:14px">
+              <label class="settings-toggle-label">
+                <input type="checkbox" id="android-enabled-chk" />
+                <span>Auto-sync every</span>
+                <select id="android-interval-sel" class="tg-interval-select">
+                  <option value="60"   >1 min</option>
+                  <option value="300"  selected>5 min</option>
+                  <option value="600"  >10 min</option>
+                  <option value="900"  >15 min</option>
+                  <option value="1800" >30 min</option>
+                  <option value="3600" >1 h</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="settings-actions" style="margin-top:8px">
+              <span id="android-status-conn" class="tg-status"></span>
+              <button class="btn-secondary" id="android-sync-now-btn">Sync Now</button>
+              <button class="btn-secondary" id="android-disconnect-btn">Disconnect</button>
+              <button class="btn-primary"   id="android-save-btn">Save</button>
+            </div>
+          </div>
+
+        </div><!-- /settings-panel-android -->
+
         <div id="settings-panel-locked" class="settings-panel">
           <h3 class="settings-panel-title">Locked Notes</h3>
           <p class="settings-panel-hint">Click × to permanently decrypt a note. You will be asked for its password.</p>
@@ -407,6 +651,93 @@
           </div>
           <pre id="notable-import-log" class="import-debug hidden"></pre>
         </div><!-- /settings-panel-notable -->
+
+        <!-- ══════════════════════════════════════════════════════════════════ -->
+        <!--  Manage Space                                                     -->
+        <!-- ══════════════════════════════════════════════════════════════════ -->
+        <div id="settings-panel-trash" class="settings-panel">
+          <h3 class="settings-panel-title">Trash</h3>
+          <p class="settings-panel-hint">Notes moved to Trash are permanently deleted after the period below.</p>
+
+          <div class="settings-field">
+            <label for="trash-expire-select">Auto-delete after</label>
+            <select id="trash-expire-select" class="settings-select">
+              <option value="1">1 month</option>
+              <option value="2">2 months</option>
+              <option value="3" selected>3 months</option>
+              <option value="4">4 months</option>
+              <option value="5">5 months</option>
+              <option value="6">6 months</option>
+              <option value="7">7 months</option>
+              <option value="8">8 months</option>
+              <option value="9">9 months</option>
+              <option value="10">10 months</option>
+              <option value="11">11 months</option>
+              <option value="12">12 months</option>
+            </select>
+          </div>
+
+          <div class="settings-actions">
+            <span class="trash-settings-status" id="trash-settings-status"></span>
+            <button class="btn-primary" id="trash-save-btn">Save</button>
+          </div>
+
+          <div class="trash-divider"></div>
+
+          <div class="trash-empty-row">
+            <div>
+              <div class="trash-empty-label">Empty Trash</div>
+              <div class="trash-empty-hint">Permanently removes all notes and files in Trash right now.</div>
+            </div>
+            <button class="btn-danger" id="trash-empty-btn">Empty Trash</button>
+          </div>
+        </div><!-- /settings-panel-trash -->
+
+        <!-- Empty-trash confirmation dialog -->
+        <div id="trash-confirm-overlay" class="modal-overlay hidden">
+          <div class="encrypt-dialog-box trash-confirm-box">
+            <h3 class="trash-confirm-title">Empty Trash</h3>
+            <p class="trash-confirm-msg">Attention! This will remove all notes and files from Trash forever.</p>
+            <div class="dialog-buttons">
+              <button class="btn-primary trash-confirm-cancel" id="trash-confirm-cancel">Cancel</button>
+              <button class="btn-danger"   id="trash-confirm-ok">OK</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="settings-panel-storage" class="settings-panel">
+          <h3 class="settings-panel-title">Manage Space</h3>
+
+          <div id="storage-loading" class="storage-spinner-wrap">
+            <div class="storage-spinner"></div>
+            <span>Calculating…</span>
+          </div>
+
+          <div id="storage-content" class="hidden">
+
+            <!-- Stacked colour bar -->
+            <div id="storage-bar" class="storage-bar"></div>
+
+            <!-- Colour legend row -->
+            <div id="storage-legend" class="storage-legend"></div>
+
+            <!-- Grand total -->
+            <div id="storage-total" class="storage-total-row">
+              <span class="storage-total-label">Total used</span>
+              <span id="storage-total-val" class="storage-total-val">—</span>
+            </div>
+
+            <!-- Category rows (built by JS) -->
+            <div id="storage-rows" class="storage-rows"></div>
+
+            <!-- Warning -->
+            <p class="storage-warn">
+              ⚠ Deleting attachment files will break any note that links to them.
+            </p>
+
+          </div>
+        </div><!-- /settings-panel-storage -->
+
       </div><!-- /settings-right-panel -->
     </div><!-- /settings-dialog -->
   </div><!-- /settings-modal -->

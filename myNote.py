@@ -12,8 +12,11 @@ import json as _json
 import socket as _socket
 import shutil
 import ctypes
+import urllib.parse as _urlparse
 import requests
 import paths
+import json
+import uuid as _uuid_mod
 
 app = Flask(
     __name__,
@@ -63,7 +66,7 @@ def _read_frontmatter(filepath: str) -> dict:
         return {}
     m = re.match(r'^---\s*\n(.*?)\n---', content, re.DOTALL)
     if not m:
-        return {'tags': [], 'encrypted': False}
+        return {'tags': [], 'encrypted': False, 'id': '', 'trashed_at': None}
     fm = m.group(1)
     tags: list = []
     tm = re.search(r'^tags:\s*\[([^\]]*)\]', fm, re.MULTILINE)
@@ -74,8 +77,12 @@ def _read_frontmatter(filepath: str) -> dict:
         if tm2:
             tags = [re.sub(r'^[ \t]+-[ \t]+', '', l).strip()
                     for l in tm2.group(1).splitlines() if l.strip()]
-    encrypted = bool(re.search(r'^encrypted:\s*true', fm, re.MULTILINE))
-    return {'tags': tags, 'encrypted': encrypted}
+    encrypted  = bool(re.search(r'^encrypted:\s*true', fm, re.MULTILINE))
+    id_m       = re.search(r'^id:\s*(\S+)', fm, re.MULTILINE)
+    note_id    = id_m.group(1) if id_m else ''
+    ta_m       = re.search(r'^trashed_at:\s*(\S+)', fm, re.MULTILINE)
+    trashed_at = float(ta_m.group(1)) if ta_m else None
+    return {'tags': tags, 'encrypted': encrypted, 'id': note_id, 'trashed_at': trashed_at}
 
 
 def _write_tags(filepath: str, tags: list) -> None:
@@ -101,6 +108,57 @@ def _write_tags(filepath: str, tags: list) -> None:
         new_content = '---\n' + fm + '\n---\n' + rest
     else:
         new_content = ('---\n' + tag_line + '\n---\n' if tags else '') + content
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+
+
+def _inject_note_id(filepath: str) -> str:
+    """Ensure the note has an id: UUID in its frontmatter.
+    Creates frontmatter if absent. Returns the UUID string."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except OSError:
+        return ''
+    fm_match = re.match(r'^---\s*\n([\s\S]*?)\n---\s*\n?', content)
+    if fm_match:
+        fm_block = fm_match.group(1)
+        m = re.search(r'^id:\s*(\S+)', fm_block, re.MULTILINE)
+        if m:
+            return m.group(1)                       # already has id
+        note_id     = str(_uuid_mod.uuid4())
+        rest        = content[fm_match.end():]
+        new_content = '---\nid: ' + note_id + '\n' + fm_block + '\n---\n' + rest
+    else:
+        note_id     = str(_uuid_mod.uuid4())
+        new_content = '---\nid: ' + note_id + '\n---\n' + content
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+    except OSError:
+        pass
+    return note_id
+
+
+def _set_trashed_at(filepath: str, ts: 'float | None') -> None:
+    """Write or remove the trashed_at: field in a note's frontmatter."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except OSError:
+        return
+    fm_match = re.match(r'^---\s*\n([\s\S]*?)\n---\s*\n?', content)
+    if not fm_match:
+        if ts is None:
+            return
+        new_content = f'---\ntrashed_at: {ts}\n---\n' + content
+    else:
+        fm_block = fm_match.group(1)
+        rest     = content[fm_match.end():]
+        fm_block = re.sub(r'^trashed_at:[ \t]+.*\n?', '', fm_block, flags=re.MULTILINE)
+        if ts is not None:
+            fm_block = f'trashed_at: {ts}\n' + fm_block
+        new_content = '---\n' + fm_block.lstrip('\n') + '\n---\n' + rest
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(new_content)
 
@@ -273,6 +331,7 @@ def api_create_note():
         abort(409)
     with open(fp, 'w', encoding='utf-8') as f:
         f.write(content)
+    _inject_note_id(fp)
     return jsonify({'name': name}), 201
 
 
@@ -285,6 +344,7 @@ def api_save_note(name):
     content = data.get('content', '')
     with open(fp, 'w', encoding='utf-8') as f:
         f.write(content)
+    _inject_note_id(fp)
     return jsonify({'ok': True})
 
 
@@ -320,6 +380,7 @@ def api_trash_note(name):
     if TRASH_TAG not in tags:
         tags.append(TRASH_TAG)
     _write_tags(fp, tags)
+    _set_trashed_at(fp, time.time())
     return jsonify({'ok': True})
 
 
@@ -330,6 +391,7 @@ def api_restore_note(name):
         abort(404)
     tags = [t for t in _read_frontmatter(fp).get('tags', []) if t != TRASH_TAG]
     _write_tags(fp, tags)
+    _set_trashed_at(fp, None)
     return jsonify({'ok': True})
 
 
@@ -803,7 +865,6 @@ def _build_share_html(title_esc, created, modified, tags_html,
 def api_share():
     """Generate a self-contained shareable HTML file and save to Downloads."""
     import mimetypes as _mimetypes
-    import urllib.parse as _urlparse
     from html import escape as _he
     from datetime import datetime as _dt
 
@@ -1167,7 +1228,7 @@ def _tg_create_note(title: str, body: str) -> None:
             _tg_log.debug('  skipped append — no body content')
     else:
         # New note: write frontmatter + heading + body
-        fm      = '---\ntags: [Telegram]\n---\n'
+        fm      = '---\nid: ' + str(_uuid_mod.uuid4()) + '\ntags: [Telegram]\n---\n'
         content = fm + f'# {title}\n' + (('\n' + body.strip()) if body.strip() else '')
         with open(fp, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -1225,6 +1286,191 @@ def _tg_run(coro):
     finally:
         loop.close()
 
+# ── Telegram command helpers ───────────────────────────────────────────────────
+
+_TG_CMD_GET   = re.compile(r'^get\s+(.+)$', re.IGNORECASE)
+_TG_MAX_SEND  = 4000    # stay safely under Telegram's 4096-char hard limit
+# Invisible marker (U+200C ZERO WIDTH NON-JOINER) prepended to every reply we send.
+# Lets us skip our own bot replies on re-poll without blocking the user's own commands.
+_TG_REPLY_MARK = '‌'  # U+200C ZERO WIDTH NON-JOINER — invisible in Telegram UI
+
+
+def _tg_find_note(search: str) -> 'tuple[str, str] | None':
+    """Find a note by exact then partial name/title match.
+
+    Returns (filepath, note_name) or None.
+    """
+    q = search.lower().strip()
+    if not q:
+        return None
+    partial: 'tuple[str, str] | None' = None
+    partial_score = -1.0
+    for fp in _note_files():
+        name  = os.path.splitext(os.path.basename(fp))[0]
+        title = (_extract_title(fp) or '').strip()
+        nl    = name.lower()
+        tl    = title.lower()
+        if nl == q or tl == q:
+            return (fp, name)   # exact — stop immediately
+        if q in nl or q in tl:
+            score = max(
+                len(q) / len(nl) if nl else 0.0,
+                len(q) / len(tl) if tl else 0.0,
+            )
+            if score > partial_score:
+                partial_score = score
+                partial = (fp, name)
+    return partial
+
+
+def _tg_note_body(fp: str) -> str:
+    """Read a note file and return its body with frontmatter stripped."""
+    try:
+        with open(fp, 'r', encoding='utf-8') as f:
+            raw = f.read()
+    except OSError:
+        return '[Error reading note]'
+    body = re.sub(r'^---\s*\n[\s\S]*?\n---\s*\n?', '', raw).strip()
+    return body or '[Empty note]'
+
+
+def _md_to_telegram(body: str) -> 'tuple[str, list]':
+    """Convert markdown body to plain text and collect local attachment paths.
+
+    Returns (plain_text, [local_file_paths_in_order_of_appearance]).
+    Images are removed from the text and queued for sending as Telegram files.
+    Non-image attachment links are replaced with a 📎 filename label.
+    """
+    attach_dir  = paths.get_attachments_dir()
+    media_files: list = []
+
+    def _resolve(url: str) -> 'str | None':
+        """Return local path if url is a known /attachments/… file, else None."""
+        if not url.startswith('/attachments/'):
+            return None
+        subpath = _urlparse.unquote(url[len('/attachments/'):])
+        fp = os.path.join(attach_dir, subpath)
+        return fp if os.path.exists(fp) else None
+
+    def _queue(fp: str) -> None:
+        if fp and fp not in media_files:
+            media_files.append(fp)
+
+    def _img_sub(m: 're.Match') -> str:
+        fp = _resolve(m.group(2))
+        if fp:
+            _queue(fp)
+        return ''   # always erase image markdown; file is sent separately if found
+
+    def _link_sub(m: 're.Match') -> str:
+        ltext, url = m.group(1), m.group(2)
+        fp = _resolve(url)
+        if fp:
+            _queue(fp)
+            fname = _urlparse.unquote(url.split('/')[-1])
+            return f'📎 {fname}'
+        return ltext            # external URL → just show the label
+
+    lines     = body.split('\n')
+    out: list = []
+    in_code   = False
+    code_buf: list = []
+    code_lang = ''
+
+    for raw in lines:
+        line = raw.rstrip()
+
+        # ── fenced code block ───────────────────────────────────────────────
+        if re.match(r'^\s*```', line):
+            if not in_code:
+                in_code   = True
+                code_lang = line.lstrip('`').strip()
+                code_buf  = []
+            else:
+                in_code = False
+                if code_buf:
+                    if code_lang:
+                        out.append(f'[{code_lang}]')
+                    out.extend(code_buf)
+                    out.append('')
+                code_buf  = []
+                code_lang = ''
+            continue
+
+        if in_code:
+            code_buf.append(line)
+            continue
+
+        # ── table row ───────────────────────────────────────────────────────
+        if line.lstrip().startswith('|'):
+            cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            # separator row (dashes / colons) → underline the previous row
+            if all(re.match(r'^[-: ]*$', c) for c in cells):
+                if out:
+                    out.append('─' * max(len(out[-1]), 4))
+                continue
+            out.append('   '.join(c for c in cells if c))
+            continue
+
+        # ── images → queue file, erase from text ────────────────────────────
+        line = re.sub(r'!\[([^\]]*)\]\(([^)]*)\)', _img_sub, line)
+        line = re.sub(r'!\[[^\]]*\]',              '',        line)  # safety: bare ![...] remnants
+
+        # ── non-image links ──────────────────────────────────────────────────
+        line = re.sub(r'\[([^\]]+)\]\(([^)]*)\)', _link_sub, line)
+
+        # ── headings ────────────────────────────────────────────────────────
+        hm = re.match(r'^(#{1,6})\s+(.*)', line)
+        if hm:
+            text  = hm.group(2).strip()
+            out.append(text)
+            out.append('─' * min(60, max(len(text), 4)))
+            continue
+
+        # ── horizontal rule ──────────────────────────────────────────────────
+        if re.match(r'^[-*_]{3,}\s*$', line):
+            out.append('─' * 40)
+            continue
+
+        # ── blockquote ───────────────────────────────────────────────────────
+        line = re.sub(r'^(>\s?)+', '| ', line)
+
+        # ── inline formatting (bold / italic / strikethrough / code) ─────────
+        line = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', line)
+        line = re.sub(r'\*\*(.+?)\*\*',     r'\1', line)
+        line = re.sub(r'__(.+?)__',          r'\1', line)
+        line = re.sub(r'\*(.+?)\*',          r'\1', line)
+        line = re.sub(r'_(.+?)_',            r'\1', line)
+        line = re.sub(r'~~(.+?)~~',          r'\1', line)
+        line = re.sub(r'`(.+?)`',            r'\1', line)
+
+        out.append(line)
+
+    # flush any unclosed code block
+    if in_code and code_buf:
+        if code_lang:
+            out.append(f'[{code_lang}]')
+        out.extend(code_buf)
+
+    plain = '\n'.join(out).strip()
+
+    # ── final sweep: remove every surviving image/media reference ─────────────
+    # Pass 1: standard markdown image syntax that slipped through line processing
+    plain = re.sub(r'!\[([^\]]*)\]\([^)]*\)', '', plain)
+    # Pass 2: bare ![alt] without a URL
+    plain = re.sub(r'!\[[^\]]*\]', '', plain)
+    # Pass 3: bare !filename.ext — catches tg_20260610_131817.jpg style names
+    plain = re.sub(
+        r'![\w%._-]+\.(?:jpe?g|png|gif|webp|bmp|tiff?|mp4|m4v|mov|avi|wmv|flv|'
+        r'mp3|wav|ogg|flac|aac|m4a|3gp|webm)',
+        '', plain, flags=re.IGNORECASE)
+
+    # collapse blank lines that result from removals
+    plain = re.sub(r'\n{3,}', '\n\n', plain)
+    plain = plain.strip()
+    return plain, media_files
+
+
 async def _tg_process_message(client, msg) -> None:
     """Convert one Telethon Message into a note + downloaded attachments."""
     try:
@@ -1241,12 +1487,72 @@ async def _tg_process_message(client, msg) -> None:
     # msg.text applies the client's parse_mode and returns e.g. **bold** for bold entities.
     # msg.raw_text is always the plain string the user typed, with no markdown markup added.
     text  = (msg.raw_text or '').strip()
+
+    # Skip our own bot replies — they carry an invisible marker we prepended when sending.
+    if text.startswith(_TG_REPLY_MARK):
+        _tg_log.debug('  skipped — our own get-reply (marker detected)')
+        return
+
     lines = text.split('\n') if text else []
     title = lines[0][:80].strip() if lines else _tg_ts_title()
     body  = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ''
 
     _tg_log.debug('  msg id=%-8s  photo=%-5s  doc=%-5s  text=%.50r',
                   msg.id, bool(msg.photo), bool(msg.document), text)
+
+    # ── Command: get <notename> ────────────────────────────────────────────────
+    cmd_m = _TG_CMD_GET.match(text) if text else None
+    if cmd_m and not msg.photo and not msg.document:
+        search = cmd_m.group(1).strip()
+        _tg_log.info('Command "get" received — searching for %r', search)
+        result = _tg_find_note(search)
+        if result is None:
+            await client.send_message(msg.peer_id,
+                                      _TG_REPLY_MARK + f'❌ Note not found: {search}')
+        else:
+            fp_r, note_name = result
+            fm_r = _read_frontmatter(fp_r)
+            if fm_r.get('encrypted'):
+                await client.send_message(
+                    msg.peer_id,
+                    _TG_REPLY_MARK + f'\U0001f512 "{note_name}" is encrypted and cannot be sent.',
+                )
+            else:
+                raw_body = _tg_note_body(fp_r)
+                # Strip leading H1 — it duplicates the title we show in the header
+                raw_body = re.sub(r'^[ \t]*#[^#\n][^\n]*\n?', '',
+                                  raw_body.lstrip('\n'), count=1).lstrip('\n')
+                plain, media_files = _md_to_telegram(raw_body)
+                underline = '─' * min(40, max(len(note_name), 4))
+                header = _TG_REPLY_MARK + f'\U0001f4d2 {note_name}\n{underline}\n\n'
+                if len(header) + len(plain) > _TG_MAX_SEND:
+                    plain = plain[:_TG_MAX_SEND - len(header) - 15] + '\n\n…[truncated]'
+                max_sent_id = 0
+                try:
+                    sent = await client.send_message(msg.peer_id, header + plain)
+                    max_sent_id = max(max_sent_id, sent.id)
+                    _tg_log.info('  text sent for "get %s"', search)
+                except Exception as _e:
+                    _tg_log.error('  failed to send text: %s', _e)
+                for mf in media_files:
+                    try:
+                        sent_f = await client.send_file(msg.peer_id, mf)
+                        if sent_f:
+                            max_sent_id = max(max_sent_id, sent_f.id)
+                        _tg_log.debug('  sent file: %s', os.path.basename(mf))
+                    except Exception as _ef:
+                        _tg_log.error('  failed to send file %s: %s',
+                                      os.path.basename(mf), _ef)
+                # Advance the poll watermark past our own replies so they are
+                # never re-ingested as notes on the next poll cycle.
+                if max_sent_id > 0:
+                    _c = paths._load_config()
+                    _t = _c.setdefault('telegram', {})
+                    _t['last_message_id'] = max(
+                        int(_t.get('last_message_id', 0)), max_sent_id)
+                    paths._save_config(_c)
+                    _tg_log.debug('  watermark advanced to %d', max_sent_id)
+        return  # do not create a note from the command message
 
     # Skip entirely empty messages (no text, no media — nothing to save)
     if not text and not msg.photo and not msg.document:
@@ -1428,7 +1734,9 @@ def _telegram_user_poll_loop() -> None:
                     except Exception as e:
                         _tg_log.error('Error processing msg id=%s: %s', msg.id, e, exc_info=True)
                     c = paths._load_config()
-                    c.setdefault('telegram', {})['last_message_id'] = msg.id
+                    t = c.setdefault('telegram', {})
+                    # Use max() so an advanced watermark set by a get-reply is never rolled back
+                    t['last_message_id'] = max(int(t.get('last_message_id', 0)), msg.id)
                     paths._save_config(c)
             finally:
                 await client.disconnect()
@@ -1685,6 +1993,1016 @@ def tg_delete_session():
 
 
 # ---------------------------------------------------------------------------
+# Note-ID index + ID-aware bidirectional sync
+# ---------------------------------------------------------------------------
+
+def _build_note_id_index(notes_dir: str) -> dict:
+    """Scan .md files; return {'by_id': {uuid: info}, 'no_id': [info]}.
+    info = {'path': abs_path, 'mtime': float, 'filename': basename}"""
+    by_id = {}
+    no_id = []
+    if not os.path.isdir(notes_dir):
+        return {'by_id': by_id, 'no_id': no_id}
+    for entry in os.scandir(notes_dir):
+        if not entry.is_file(follow_symlinks=False) or not entry.name.endswith('.md'):
+            continue
+        fm      = _read_frontmatter(entry.path)
+        note_id = fm.get('id', '')
+        mtime   = entry.stat().st_mtime
+        info    = {'path': entry.path, 'mtime': mtime, 'filename': entry.name}
+        if note_id:
+            if note_id not in by_id or mtime > by_id[note_id]['mtime']:
+                by_id[note_id] = info
+        else:
+            no_id.append(info)
+    return {'by_id': by_id, 'no_id': no_id}
+
+
+def _sync_notes_by_id(local_dir: str, remote_dir: str) -> dict:
+    """Bidirectional note sync matched by UUID, not filename.
+    When the same UUID has different filenames (rename happened) the newer
+    mtime wins: the stale file on the losing side is deleted and replaced.
+    Falls back to filename matching for notes without an id field."""
+    os.makedirs(remote_dir, exist_ok=True)
+    to_remote = 0
+    to_local  = 0
+    skipped   = 0
+
+    local_idx  = _build_note_id_index(local_dir)
+    remote_idx = _build_note_id_index(remote_dir)
+    l_by_id, l_no_id = local_idx['by_id'], local_idx['no_id']
+    r_by_id, r_no_id = remote_idx['by_id'], remote_idx['no_id']
+
+    # Don't pull back notes we deliberately deleted
+    _deleted_names = {e['path']
+                      for e in _load_deletion_log(_deletion_log_path())['deletions']
+                      if e['type'] == 'note'}
+
+    # ── Pass 1: ID-aware ──────────────────────────────────────────────────────
+    for note_id in set(l_by_id) | set(r_by_id):
+        l = l_by_id.get(note_id)
+        r = r_by_id.get(note_id)
+
+        if l and not r:
+            shutil.copy2(l['path'], os.path.join(remote_dir, l['filename']))
+            to_remote += 1
+        elif r and not l:
+            if r['filename'] not in _deleted_names:
+                shutil.copy2(r['path'], os.path.join(local_dir, r['filename']))
+                to_local += 1
+        else:
+            lm, rm = l['mtime'], r['mtime']
+            if lm > rm + 1:                          # local is newer → push
+                if l['filename'] != r['filename']:
+                    try: os.remove(r['path'])
+                    except OSError: pass
+                shutil.copy2(l['path'], os.path.join(remote_dir, l['filename']))
+                to_remote += 1
+            elif rm > lm + 1:                        # remote is newer → pull
+                if r['filename'] != l['filename']:
+                    try: os.remove(l['path'])
+                    except OSError: pass
+                shutil.copy2(r['path'], os.path.join(local_dir, r['filename']))
+                to_local += 1
+            else:                                    # same age (within 1 s)
+                if l['filename'] != r['filename']:   # filename drift — local wins
+                    try: os.remove(r['path'])
+                    except OSError: pass
+                    shutil.copy2(l['path'], os.path.join(remote_dir, l['filename']))
+                    to_remote += 1
+                else:
+                    skipped += 1
+
+    # ── Pass 2: filename-based fallback for notes without an id ───────────────
+    l_no = {i['filename']: i for i in l_no_id}
+    r_no = {i['filename']: i for i in r_no_id}
+    for fname in set(l_no) | set(r_no):
+        l = l_no.get(fname)
+        r = r_no.get(fname)
+        if l and not r:
+            shutil.copy2(l['path'], os.path.join(remote_dir, fname))
+            to_remote += 1
+        elif r and not l:
+            if fname not in _deleted_names:
+                shutil.copy2(r['path'], os.path.join(local_dir, fname))
+                to_local += 1
+        else:
+            lm, rm = l['mtime'], r['mtime']
+            if lm > rm + 1:
+                shutil.copy2(l['path'], r['path']); to_remote += 1
+            elif rm > lm + 1:
+                shutil.copy2(r['path'], l['path']); to_local += 1
+            else:
+                skipped += 1
+
+    return {'toRemote': to_remote, 'toLocal': to_local, 'skipped': skipped}
+
+
+# ---------------------------------------------------------------------------
+# Attachment safety + deletion log
+# ---------------------------------------------------------------------------
+
+_DELETION_LOG = '.deletions.json'
+
+
+def _deletion_log_path(notes_dir: 'str | None' = None) -> str:
+    return os.path.join(notes_dir or paths.get_notes_dir(), _DELETION_LOG)
+
+
+def _load_deletion_log(log_path: str) -> dict:
+    """Return {'settings': {...}, 'deletions': [...]}.
+    Transparently migrates old list-only format."""
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):                      # legacy format
+            return {'settings': {}, 'deletions': data}
+        return {
+            'settings':  data.get('settings', {}),
+            'deletions': data.get('deletions', []) if isinstance(data.get('deletions'), list) else [],
+        }
+    except (OSError, json.JSONDecodeError):
+        return {'settings': {}, 'deletions': []}
+
+
+def _save_deletion_log(log_path: str, data: dict) -> None:
+    try:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def _log_deletions(new_entries: list) -> None:
+    """Append file-deletion entries to the local log, deduplicating by path."""
+    log_path = _deletion_log_path()
+    log_data = _load_deletion_log(log_path)
+    by_path  = {e['path']: e for e in log_data['deletions']}
+    for e in new_entries:
+        by_path[e['path']] = e
+    log_data['deletions'] = list(by_path.values())
+    _save_deletion_log(log_path, log_data)
+
+
+def _get_note_attachments(note_path: str) -> list:
+    """Return list of 'subfolder/filename' for every attachment referenced in this note."""
+    try:
+        with open(note_path, 'r', encoding='utf-8') as f:
+            body = f.read()
+    except OSError:
+        return []
+    attach_root = paths.get_attachments_dir()
+    results = []
+    for sub in ('images', 'documents', 'videos', 'audio', 'archives'):
+        sub_dir = os.path.join(attach_root, sub)
+        if not os.path.isdir(sub_dir):
+            continue
+        for fname in os.listdir(sub_dir):
+            if fname in body:
+                results.append(f'{sub}/{fname}')
+    return results
+
+
+def _is_attachment_safe_to_delete(attach_rel: str, exclude_note: str) -> bool:
+    """True when no non-trash note other than exclude_note references this attachment."""
+    fname = os.path.basename(attach_rel)
+    for fp in _note_files():
+        if fp == exclude_note:
+            continue
+        if TRASH_TAG in _read_frontmatter(fp).get('tags', []):
+            continue
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                if fname in f.read():
+                    return False
+        except OSError:
+            pass
+    return True
+
+
+def _delete_note_permanently(filepath: str) -> None:
+    """Delete a note and any attachments not referenced by other non-trash notes.
+    Logs every deletion to .deletions.json for cross-device sync."""
+    entries = []
+    now     = time.time()
+
+    for attach_rel in _get_note_attachments(filepath):
+        if _is_attachment_safe_to_delete(attach_rel, filepath):
+            abs_path = os.path.join(paths.get_attachments_dir(), attach_rel)
+            if os.path.isfile(abs_path):
+                try:
+                    os.remove(abs_path)
+                except OSError:
+                    pass
+            entries.append({'path': attach_rel, 'type': 'attachment', 'deleted_at': now})
+
+    fname = os.path.basename(filepath)
+    if os.path.isfile(filepath):
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+    entries.append({'path': fname, 'type': 'note', 'deleted_at': now})
+    _log_deletions(entries)
+
+
+def _apply_deletion_log(notes_dir: str, attach_dir: str,
+                        log_path: 'str | None' = None) -> None:
+    """Delete any files listed in the deletion log from the given directory pair."""
+    log_data = _load_deletion_log(log_path or _deletion_log_path(notes_dir))
+    for e in log_data['deletions']:
+        fp = os.path.join(notes_dir if e['type'] == 'note' else attach_dir, e['path'])
+        if os.path.isfile(fp):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+
+
+def _sync_deletion_log(local_notes: str, remote_notes: str,
+                        local_attach: str, remote_attach: str) -> None:
+    """Merge .deletions.json from both sides:
+    - settings: latest lastchanged wins and is applied to local config
+    - deletions: union by path, newest deleted_at wins
+    - housekeeping: entries older than 6 months are purged
+    Merged result is written to both sides, then deletions are applied."""
+    local_log  = _deletion_log_path(local_notes)
+    remote_log = _deletion_log_path(remote_notes)
+
+    local_data  = _load_deletion_log(local_log)
+    remote_data = _load_deletion_log(remote_log)
+
+    # ── Settings merge: latest lastchanged wins ───────────────────────────────
+    l_cfg = local_data.get('settings', {})
+    r_cfg = remote_data.get('settings', {})
+    if r_cfg.get('lastchanged', 0) > l_cfg.get('lastchanged', 0):
+        merged_settings = r_cfg
+        # Apply remote trash-expiry setting to local config
+        if 'trash_expire_months' in r_cfg:
+            cfg = paths._load_config()
+            cfg['trash_expire_months'] = r_cfg['trash_expire_months']
+            paths._save_config(cfg)
+    else:
+        merged_settings = l_cfg
+
+    # ── Deletion entries merge: union, newest deleted_at wins ─────────────────
+    by_path = {}
+    for e in local_data['deletions'] + remote_data['deletions']:
+        p = e['path']
+        if p not in by_path or e.get('deleted_at', 0) > by_path[p].get('deleted_at', 0):
+            by_path[p] = e
+
+    # Housekeeping: purge records older than 6 months
+    cutoff  = time.time() - 180 * 86400
+    by_path = {p: e for p, e in by_path.items() if e.get('deleted_at', 0) > cutoff}
+
+    merged = {'settings': merged_settings, 'deletions': list(by_path.values())}
+
+    _save_deletion_log(local_log, merged)
+    try:
+        _save_deletion_log(remote_log, merged)
+    except OSError:
+        pass
+
+    _apply_deletion_log(local_notes,  local_attach,  local_log)
+    try:
+        _apply_deletion_log(remote_notes, remote_attach, remote_log)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Trash auto-cleanup (3-month expiry)
+# ---------------------------------------------------------------------------
+
+_TRASH_MAX_AGE = 90 * 86400   # 3 months in seconds
+
+
+def _trash_cleanup_pass() -> int:
+    """Permanently delete notes that have been in trash longer than the configured period."""
+    months  = paths._load_config().get('trash_expire_months', 3)
+    cutoff  = time.time() - months * 30 * 86400
+    deleted = 0
+    for fp in _note_files():
+        fm = _read_frontmatter(fp)
+        if TRASH_TAG not in fm.get('tags', []):
+            continue
+        ta = fm.get('trashed_at')
+        if ta is None or float(ta) > cutoff:
+            continue
+        try:
+            _delete_note_permanently(fp)
+            deleted += 1
+        except Exception:
+            pass
+    if deleted:
+        _sse_broadcast(json.dumps({'type': 'notes-updated'}))
+    return deleted
+
+
+def _trash_cleanup_loop() -> None:
+    """Background thread: check for expired trash notes every hour."""
+    while True:
+        try:
+            _trash_cleanup_pass()
+        except Exception:
+            pass
+        time.sleep(3600)
+
+
+threading.Thread(target=_trash_cleanup_loop, daemon=True, name='trash-cleanup').start()
+
+
+# ---------------------------------------------------------------------------
+# iCloud Drive sync
+# ---------------------------------------------------------------------------
+
+_icloud_log = logging.getLogger('[iCloud]')
+_icloud_log.setLevel(logging.DEBUG)
+if not _icloud_log.handlers:
+    _ich = logging.StreamHandler()
+    _ich.setFormatter(logging.Formatter('%(name)s %(message)s'))
+    _icloud_log.addHandler(_ich)
+
+_icloud_wake      = threading.Event()
+_icloud_sync_lock = threading.Lock()
+
+
+def _detect_icloud_drive() -> 'str | None':
+    """Try to find the iCloud Drive root folder on this Windows machine."""
+    # ── 1. Registry (most reliable when iCloud for Windows is installed) ──────
+    try:
+        import winreg
+        _reg_candidates = [
+            (winreg.HKEY_CURRENT_USER,  r'Software\Apple Inc.\iCloud\MobileDocuments'),
+            (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Apple Inc.\iCloud'),
+            (winreg.HKEY_CURRENT_USER,  r'Software\Apple Computer, Inc.\iCloud'),
+        ]
+        for hive, keypath in _reg_candidates:
+            try:
+                with winreg.OpenKey(hive, keypath) as k:
+                    for valname in ('Path', 'iCloudDriveRoot', 'RootPath', ''):
+                        try:
+                            val, _ = winreg.QueryValueEx(k, valname)
+                            p = str(val).strip()
+                            if p and os.path.isdir(p):
+                                _icloud_log.debug('Found via registry [%s] %r', keypath, p)
+                                return p
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except ImportError:
+        pass
+
+    # ── 2. Well-known filesystem paths ────────────────────────────────────────
+    home = os.path.expanduser('~')
+    localapp = os.environ.get('LOCALAPPDATA', '')
+    candidates = [
+        os.path.join(home,     'iCloudDrive'),
+        os.path.join(home,     'Apple', 'CloudDrive'),
+        os.path.join(home,     'Apple', 'iCloud Drive'),
+        os.path.join(localapp, 'Apple', 'CloudDrive'),
+    ]
+    for p in candidates:
+        if p and os.path.isdir(p):
+            _icloud_log.debug('Found via filesystem scan: %r', p)
+            return p
+
+    _icloud_log.debug('iCloud Drive not found on this machine')
+    return None
+
+
+def _icloud_sync_dirs(local_dir: str, remote_dir: str,
+                      *, recursive: bool = False,
+                      exts: 'set | None' = None) -> dict:
+    """Sync two directories with 'newest wins' logic. Returns stats dict."""
+    os.makedirs(remote_dir, exist_ok=True)
+    to_remote = 0
+    to_local  = 0
+    skipped   = 0
+
+    def _collect(d: str) -> dict:          # rel_path → abs_path
+        out = {}
+        if not os.path.isdir(d):
+            return out
+        for entry in os.scandir(d):
+            if entry.is_file(follow_symlinks=False):
+                rel = entry.name
+                if exts is None or os.path.splitext(rel)[1].lower() in exts:
+                    out[rel] = entry.path
+            elif recursive and entry.is_dir(follow_symlinks=False):
+                for sub_rel, sub_abs in _collect(entry.path).items():
+                    out[os.path.join(entry.name, sub_rel)] = sub_abs
+        return out
+
+    local_files  = _collect(local_dir)
+    remote_files = _collect(remote_dir)
+
+    for name in set(local_files) | set(remote_files):
+        lp = local_files.get(name)
+        rp = remote_files.get(name)
+
+        if lp and not rp:
+            # Only on PC → push to iCloud folder
+            dst = os.path.join(remote_dir, name)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(lp, dst)
+            to_remote += 1
+        elif rp and not lp:
+            # Only in iCloud folder → pull to PC
+            dst = os.path.join(local_dir, name)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(rp, dst)
+            to_local += 1
+        else:
+            lm = os.path.getmtime(lp)
+            rm = os.path.getmtime(rp)
+            if lm > rm + 1:            # +1 s tolerance for FAT/APFS rounding
+                shutil.copy2(lp, rp)
+                to_remote += 1
+            elif rm > lm + 1:
+                shutil.copy2(rp, lp)
+                to_local += 1
+            else:
+                skipped += 1
+
+    return {'toRemote': to_remote, 'toLocal': to_local, 'skipped': skipped}
+
+
+def _icloud_do_sync() -> dict:
+    """Full bidirectional sync: notes (.md) + all attachment sub-dirs."""
+    cfg   = paths._load_config().get('icloud', {})
+    drive = cfg.get('drive_path', '')
+    folder = cfg.get('folder', 'myNotes')
+    if not drive or not os.path.isdir(drive):
+        return {'ok': False, 'error': 'iCloud Drive path not found or not accessible.'}
+
+    remote_root   = os.path.join(drive, folder)
+    remote_notes  = os.path.join(remote_root, 'notes')
+    remote_attach = os.path.join(remote_root, 'attachments')
+    local_notes   = paths.get_notes_dir()
+    local_attach  = paths.get_attachments_dir()
+
+    try:
+        with _icloud_sync_lock:
+            _sync_deletion_log(local_notes, remote_notes, local_attach, remote_attach)
+            r1 = _sync_notes_by_id(local_notes, remote_notes)
+            r2 = _icloud_sync_dirs(local_attach, remote_attach,
+                                   recursive=True)
+        total = {k: r1[k] + r2[k] for k in r1}
+        _icloud_log.info('Sync done → %s', total)
+
+        now = time.time()
+        c   = paths._load_config()
+        c.setdefault('icloud', {})['last_sync'] = now
+        paths._save_config(c)
+
+        _sse_broadcast(json.dumps({'type': 'icloud_sync', 'result': total}))
+        return {'ok': True, 'lastSync': now, **total}
+    except Exception as e:
+        _icloud_log.error('Sync failed: %s', e, exc_info=True)
+        return {'ok': False, 'error': str(e)}
+
+
+def _icloud_loop() -> None:
+    """Background auto-sync thread."""
+    _icloud_log.info('iCloud sync thread started')
+    while True:
+        cfg      = paths._load_config().get('icloud', {})
+        enabled  = cfg.get('enabled', False)
+        interval = int(cfg.get('sync_interval', 300))
+        if enabled and cfg.get('connected', False):
+            _icloud_log.debug('Auto-sync starting …')
+            _icloud_do_sync()
+        _icloud_wake.clear()
+        _icloud_wake.wait(timeout=interval)
+
+
+_icloud_thread = threading.Thread(target=_icloud_loop,
+                                  daemon=True, name='icloud-sync')
+_icloud_thread.start()
+
+
+def _migrate_existing_note_ids() -> None:
+    """Backfill UUIDs into old notes; set trashed_at for already-trashed notes."""
+    notes_dir = paths.get_notes_dir()
+    if not os.path.isdir(notes_dir):
+        return
+    now = time.time()
+    for fname in os.listdir(notes_dir):
+        if not fname.endswith('.md'):
+            continue
+        fp = os.path.join(notes_dir, fname)
+        try:
+            _inject_note_id(fp)
+            fm = _read_frontmatter(fp)
+            if TRASH_TAG in fm.get('tags', []) and fm.get('trashed_at') is None:
+                _set_trashed_at(fp, now)
+        except Exception:
+            pass
+
+
+threading.Thread(target=_migrate_existing_note_ids,
+                 daemon=True, name='note-id-migration').start()
+
+
+# ── iCloud routes ─────────────────────────────────────────────────────────────
+
+@app.route('/api/icloud', methods=['GET'])
+def get_icloud():
+    cfg = paths._load_config().get('icloud', {})
+    last = cfg.get('last_sync', 0)
+    return jsonify({
+        'connected':    cfg.get('connected',    False),
+        'enabled':      cfg.get('enabled',      False),
+        'drivePath':    cfg.get('drive_path',   ''),
+        'folder':       cfg.get('folder',       'myNotes'),
+        'syncInterval': int(cfg.get('sync_interval', 300)),
+        'lastSync':     last,
+        'lastSyncStr':  (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last))
+                         if last else 'Never'),
+    })
+
+
+@app.route('/api/icloud/detect', methods=['GET'])
+def icloud_detect():
+    path = _detect_icloud_drive()
+    return jsonify({'found': path is not None, 'path': path or ''})
+
+
+@app.route('/api/icloud/setup', methods=['POST'])
+def icloud_setup():
+    """Validate path, create folder structure, mark connected."""
+    data   = request.get_json(force=True)
+    drive  = str(data.get('drivePath', '')).strip()
+    folder = str(data.get('folder', 'myNotes')).strip() or 'myNotes'
+    if not drive:
+        return jsonify({'ok': False, 'error': 'Please enter the iCloud Drive path.'})
+    if not os.path.isdir(drive):
+        return jsonify({'ok': False,
+                        'error': f'Folder not found: {drive}\n'
+                                  'Make sure iCloud for Windows is installed and signed in.'})
+    try:
+        remote_root = os.path.join(drive, folder)
+        for sub in ['notes',
+                    os.path.join('attachments', 'images'),
+                    os.path.join('attachments', 'documents'),
+                    os.path.join('attachments', 'archives'),
+                    os.path.join('attachments', 'videos')]:
+            os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
+        _icloud_log.info('Folder structure created at %s', remote_root)
+
+        cfg = paths._load_config()
+        c   = cfg.setdefault('icloud', {})
+        c['drive_path']    = drive
+        c['folder']        = folder
+        c['connected']     = True
+        c['enabled']       = True
+        c['sync_interval'] = int(data.get('syncInterval', 300))
+        paths._save_config(cfg)
+        _icloud_wake.set()
+        return jsonify({'ok': True})
+    except Exception as e:
+        _icloud_log.error('setup failed: %s', e, exc_info=True)
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/api/icloud', methods=['POST'])
+def save_icloud():
+    """Update enabled / sync-interval without re-running setup."""
+    data = request.get_json(force=True)
+    cfg  = paths._load_config()
+    c    = cfg.setdefault('icloud', {})
+    if 'enabled'      in data: c['enabled']       = bool(data['enabled'])
+    if 'syncInterval' in data: c['sync_interval'] = max(60, int(data['syncInterval']))
+    paths._save_config(cfg)
+    _icloud_wake.set()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/icloud/sync', methods=['POST'])
+def icloud_sync_now():
+    result = _icloud_do_sync()
+    return jsonify(result)
+
+
+@app.route('/api/icloud', methods=['DELETE'])
+def icloud_disconnect():
+    cfg = paths._load_config()
+    c   = cfg.get('icloud', {})
+    c['connected'] = False
+    c['enabled']   = False
+    paths._save_config(cfg)
+    _icloud_log.info('iCloud disconnected by user')
+    return jsonify({'ok': True})
+
+
+# ---------------------------------------------------------------------------
+# Google Drive (Android) sync
+# ---------------------------------------------------------------------------
+
+_gdrive_log  = logging.getLogger('[GDrive]')
+_gdrive_log.setLevel(logging.DEBUG)
+if not _gdrive_log.handlers:
+    _gh = logging.StreamHandler()
+    _gh.setFormatter(logging.Formatter('%(name)s %(message)s'))
+    _gdrive_log.addHandler(_gh)
+
+_gdrive_wake      = threading.Event()
+_gdrive_sync_lock = threading.Lock()
+
+
+def _detect_google_drive() -> 'str | None':
+    """Locate the Google Drive local sync folder on this Windows machine."""
+    # ── 1. Registry (Google Drive for Desktop) ────────────────────────────
+    try:
+        import winreg
+        _reg_keys = [
+            (winreg.HKEY_CURRENT_USER,  r'Software\Google\DriveFS'),
+            (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Google\DriveFS'),
+            (winreg.HKEY_CURRENT_USER,  r'Software\Google\Drive'),
+            (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Google\Drive'),
+        ]
+        for hive, keypath in _reg_keys:
+            try:
+                with winreg.OpenKey(hive, keypath) as k:
+                    for valname in ('DefaultMountPoint', 'Path', 'MountPoint'):
+                        try:
+                            val, _ = winreg.QueryValueEx(k, valname)
+                            p = str(val).strip()
+                            # Google Drive for Desktop mounts as a virtual drive,
+                            # "My Drive" is a sub-folder of the mount point
+                            for candidate in [os.path.join(p, 'My Drive'), p]:
+                                if candidate and os.path.isdir(candidate):
+                                    _gdrive_log.debug(
+                                        'Found via registry [%s] %r', keypath, candidate)
+                                    return candidate
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except ImportError:
+        pass
+
+    # ── 2. Scan all drive letters for a Google Drive virtual mount ─────────
+    import string
+    for letter in string.ascii_uppercase:
+        p = f'{letter}:\\My Drive'
+        if os.path.isdir(p):
+            _gdrive_log.debug('Found virtual drive mount: %r', p)
+            return p
+
+    # ── 3. Common filesystem paths (Backup and Sync / legacy) ─────────────
+    home = os.path.expanduser('~')
+    fs_candidates = [
+        os.path.join(home, 'Google Drive'),
+        os.path.join(home, 'Google Drive (Stream)'),
+        os.path.join(home, 'My Drive'),
+        os.path.join(home, 'OneDrive'),    # fallback hint only — not Google Drive
+    ]
+    for p in fs_candidates[:3]:            # skip OneDrive
+        if p and os.path.isdir(p):
+            _gdrive_log.debug('Found via filesystem: %r', p)
+            return p
+
+    _gdrive_log.debug('Google Drive folder not found on this machine')
+    return None
+
+
+def _gdrive_do_sync() -> dict:
+    """Full bidirectional sync (notes + attachments) with Google Drive folder."""
+    cfg    = paths._load_config().get('gdrive', {})
+    drive  = cfg.get('drive_path', '')
+    folder = cfg.get('folder', 'myNotes')
+    if not drive or not os.path.isdir(drive):
+        return {'ok': False, 'error': 'Google Drive path not found or not accessible.'}
+
+    remote_root   = os.path.join(drive, folder)
+    remote_notes  = os.path.join(remote_root, 'notes')
+    remote_attach = os.path.join(remote_root, 'attachments')
+    local_notes   = paths.get_notes_dir()
+    local_attach  = paths.get_attachments_dir()
+
+    try:
+        with _gdrive_sync_lock:
+            _sync_deletion_log(local_notes, remote_notes, local_attach, remote_attach)
+            r1 = _sync_notes_by_id(local_notes, remote_notes)
+            r2 = _icloud_sync_dirs(local_attach, remote_attach,
+                                   recursive=True)
+        total = {k: r1[k] + r2[k] for k in r1}
+        _gdrive_log.info('Sync done → %s', total)
+
+        now = time.time()
+        c   = paths._load_config()
+        c.setdefault('gdrive', {})['last_sync'] = now
+        paths._save_config(c)
+
+        _sse_broadcast(json.dumps({'type': 'gdrive_sync', 'result': total}))
+        return {'ok': True, 'lastSync': now, **total}
+    except Exception as e:
+        _gdrive_log.error('Sync failed: %s', e, exc_info=True)
+        return {'ok': False, 'error': str(e)}
+
+
+def _gdrive_loop() -> None:
+    """Background auto-sync thread."""
+    _gdrive_log.info('Google Drive sync thread started')
+    while True:
+        cfg      = paths._load_config().get('gdrive', {})
+        enabled  = cfg.get('enabled', False)
+        interval = int(cfg.get('sync_interval', 300))
+        if enabled and cfg.get('connected', False):
+            _gdrive_log.debug('Auto-sync starting …')
+            _gdrive_do_sync()
+        _gdrive_wake.clear()
+        _gdrive_wake.wait(timeout=interval)
+
+
+_gdrive_thread = threading.Thread(target=_gdrive_loop,
+                                  daemon=True, name='gdrive-sync')
+_gdrive_thread.start()
+
+
+# ── Google Drive routes ───────────────────────────────────────────────────────
+
+@app.route('/api/gdrive', methods=['GET'])
+def get_gdrive():
+    cfg  = paths._load_config().get('gdrive', {})
+    last = cfg.get('last_sync', 0)
+    return jsonify({
+        'connected':    cfg.get('connected',    False),
+        'enabled':      cfg.get('enabled',      False),
+        'drivePath':    cfg.get('drive_path',   ''),
+        'folder':       cfg.get('folder',       'myNotes'),
+        'syncInterval': int(cfg.get('sync_interval', 300)),
+        'lastSync':     last,
+        'lastSyncStr':  (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last))
+                         if last else 'Never'),
+    })
+
+
+@app.route('/api/gdrive/detect', methods=['GET'])
+def gdrive_detect():
+    path = _detect_google_drive()
+    return jsonify({'found': path is not None, 'path': path or ''})
+
+
+@app.route('/api/gdrive/setup', methods=['POST'])
+def gdrive_setup():
+    """Validate path, create folder structure, mark connected."""
+    data   = request.get_json(force=True)
+    drive  = str(data.get('drivePath', '')).strip()
+    folder = str(data.get('folder', 'myNotes')).strip() or 'myNotes'
+    if not drive:
+        return jsonify({'ok': False, 'error': 'Please enter the Google Drive path.'})
+    if not os.path.isdir(drive):
+        return jsonify({'ok': False,
+                        'error': f'Folder not found: {drive}\n'
+                                  'Make sure Google Drive for Desktop is installed and signed in.'})
+    try:
+        remote_root = os.path.join(drive, folder)
+        for sub in ['notes',
+                    os.path.join('attachments', 'images'),
+                    os.path.join('attachments', 'documents'),
+                    os.path.join('attachments', 'archives'),
+                    os.path.join('attachments', 'videos')]:
+            os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
+        _gdrive_log.info('Folder structure created at %s', remote_root)
+
+        cfg = paths._load_config()
+        c   = cfg.setdefault('gdrive', {})
+        c['drive_path']    = drive
+        c['folder']        = folder
+        c['connected']     = True
+        c['enabled']       = True
+        c['sync_interval'] = int(data.get('syncInterval', 300))
+        paths._save_config(cfg)
+        _gdrive_wake.set()
+        return jsonify({'ok': True})
+    except Exception as e:
+        _gdrive_log.error('setup failed: %s', e, exc_info=True)
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/api/gdrive', methods=['POST'])
+def save_gdrive():
+    """Update enabled / sync-interval without re-running setup."""
+    data = request.get_json(force=True)
+    cfg  = paths._load_config()
+    c    = cfg.setdefault('gdrive', {})
+    if 'enabled'      in data: c['enabled']       = bool(data['enabled'])
+    if 'syncInterval' in data: c['sync_interval'] = max(60, int(data['syncInterval']))
+    paths._save_config(cfg)
+    _gdrive_wake.set()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/gdrive/sync', methods=['POST'])
+def gdrive_sync_now():
+    result = _gdrive_do_sync()
+    return jsonify(result)
+
+
+@app.route('/api/gdrive', methods=['DELETE'])
+def gdrive_disconnect():
+    cfg = paths._load_config()
+    c   = cfg.get('gdrive', {})
+    c['connected'] = False
+    c['enabled']   = False
+    paths._save_config(cfg)
+    _gdrive_log.info('Google Drive disconnected by user')
+    return jsonify({'ok': True})
+
+
+# ---------------------------------------------------------------------------
+# Storage analytics
+# ---------------------------------------------------------------------------
+
+_STORAGE_CATEGORIES = [
+    # key matches the attachments sub-folder name
+    {'key': 'notes',     'label': 'Notes',     'color': '#ff9f0a', 'exts': {'.md'}},
+    {'key': 'images',    'label': 'Images',    'color': '#30d158',
+     'exts': _ATTACH_IMAGE_EXTS},
+    {'key': 'documents', 'label': 'Documents', 'color': '#0a84ff',
+     'exts': {'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx',
+              '.txt','.csv','.rtf','.odt','.ods','.odp'}},
+    {'key': 'videos',    'label': 'Videos',    'color': '#ff375f',
+     'exts': _ATTACH_VIDEO_EXTS},
+    {'key': 'audio',     'label': 'Audio',     'color': '#bf5af2',
+     'exts': _ATTACH_AUDIO_EXTS},
+    {'key': 'archives',  'label': 'Archives',  'color': '#ffd60a',
+     'exts': _ATTACH_ARCHIVE_EXTS},
+]
+
+# Attachment filenames are matched via plain substring search (no regex).
+# This handles every possible embedding style — markdown, HTML, bare paths —
+# and works correctly with Unicode filenames, parentheses, &, commas, etc.
+
+
+@app.route('/api/trash/settings', methods=['GET'])
+def get_trash_settings():
+    cfg = paths._load_config()
+    return jsonify({'expireMonths': cfg.get('trash_expire_months', 3)})
+
+
+@app.route('/api/trash/settings', methods=['POST'])
+def save_trash_settings():
+    data   = request.get_json(force=True)
+    months = int(data.get('expireMonths', 3))
+    months = max(1, min(12, months))
+
+    # Persist to config
+    cfg = paths._load_config()
+    cfg['trash_expire_months'] = months
+    paths._save_config(cfg)
+
+    # Update in-memory threshold
+    global _TRASH_MAX_AGE
+    _TRASH_MAX_AGE = months * 30 * 86400
+
+    # Write timestamped setting into deletion log for cross-device sync
+    log_path = _deletion_log_path()
+    log_data = _load_deletion_log(log_path)
+    log_data['settings']['trash_expire_months'] = months
+    log_data['settings']['lastchanged'] = time.time()
+    _save_deletion_log(log_path, log_data)
+
+    return jsonify({'ok': True, 'expireMonths': months})
+
+
+@app.route('/api/trash/empty', methods=['POST'])
+def empty_trash():
+    deleted = 0
+    for fp in list(_note_files()):
+        fm = _read_frontmatter(fp)
+        if TRASH_TAG in fm.get('tags', []):
+            try:
+                _delete_note_permanently(fp)
+                deleted += 1
+            except Exception:
+                pass
+    if deleted:
+        _sse_broadcast(json.dumps({'type': 'notes-updated'}))
+    return jsonify({'ok': True, 'deleted': deleted})
+
+
+@app.route('/api/storage', methods=['GET'])
+def get_storage():
+    notes_dir  = paths.get_notes_dir()
+    attach_dir = paths.get_attachments_dir()
+
+    # ── Build flat map: filename → size for every attachment file ────────────
+    attach_sizes: dict[str, int] = {}   # basename → bytes
+    for cat in _STORAGE_CATEGORIES[1:]:
+        cat_dir = os.path.join(attach_dir, cat['key'])
+        if not os.path.isdir(cat_dir):
+            continue
+        for fname in os.listdir(cat_dir):
+            fp = os.path.join(cat_dir, fname)
+            if os.path.isfile(fp):
+                attach_sizes[fname] = os.path.getsize(fp)
+
+    # ── Single-pass note scan: sizes + reverse attachment→note map ───────────
+    notes_entries: list[dict] = []
+    notes_total   = 0
+    # filename → note title of FIRST note that references the file
+    note_ref_map: dict[str, str] = {}
+
+    if os.path.isdir(notes_dir):
+        for fname in os.listdir(notes_dir):
+            if not fname.endswith('.md'):
+                continue
+            fp        = os.path.join(notes_dir, fname)
+            note_size = os.path.getsize(fp)
+            notes_total += note_size
+            title     = _extract_title(fp)
+            attach_sum = 0
+            try:
+                body = open(fp, 'r', encoding='utf-8', errors='ignore').read()
+                # Plain substring search: works for any syntax and any filename
+                # characters (Unicode, parentheses, &, commas, etc.)
+                for aname, asize in attach_sizes.items():
+                    if aname in body:
+                        attach_sum += asize
+                        if aname not in note_ref_map:
+                            note_ref_map[aname] = title
+            except OSError:
+                pass
+            notes_entries.append({
+                'name':       title,
+                'noteSize':   note_size,
+                'attachSize': attach_sum,
+                'total':      note_size + attach_sum,
+            })
+
+    notes_entries.sort(key=lambda x: x['total'], reverse=True)
+
+    # ── Build result categories ───────────────────────────────────────────────
+    result_cats: list[dict] = []
+
+    # Notes category
+    result_cats.append({
+        'key':   'notes',
+        'label': 'Notes',
+        'color': '#ff9f0a',
+        'size':  notes_total,
+        'count': len(notes_entries),
+        'top': [
+            {
+                'name':      e['name'],
+                'size':      e['total'],
+                'noteTitle': '',      # not used for notes row
+                'detail':    (f"note {_fmt_bytes(e['noteSize'])}"
+                              + (f" + attachments {_fmt_bytes(e['attachSize'])}"
+                                 if e['attachSize'] else '')),
+            }
+            for e in notes_entries[:3]
+        ],
+    })
+
+    for cat in _STORAGE_CATEGORIES[1:]:
+        cat_dir = os.path.join(attach_dir, cat['key'])
+        files: list[dict] = []
+        cat_total = 0
+        if os.path.isdir(cat_dir):
+            for f in os.listdir(cat_dir):
+                fp = os.path.join(cat_dir, f)
+                if os.path.isfile(fp):
+                    sz = os.path.getsize(fp)
+                    cat_total += sz
+                    files.append({
+                        'name':      f,
+                        'size':      sz,
+                        'noteTitle': note_ref_map.get(f, ''),
+                        'detail':    _fmt_bytes(sz),
+                    })
+        files.sort(key=lambda x: x['size'], reverse=True)
+        result_cats.append({
+            'key':   cat['key'],
+            'label': cat['label'],
+            'color': cat['color'],
+            'size':  cat_total,
+            'count': len(files),
+            'top':   files[:3],
+        })
+
+    # Sort categories largest → smallest
+    result_cats.sort(key=lambda x: x['size'], reverse=True)
+
+    grand_total = sum(c['size'] for c in result_cats)
+    return jsonify({'total': grand_total, 'categories': result_cats})
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024:
+            return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} TB'
+
+
+# ---------------------------------------------------------------------------
 # Browser password import (Chrome / Edge, Windows only)
 # ---------------------------------------------------------------------------
 
@@ -1917,7 +3235,7 @@ def api_browser_import():
         lines.append(f'| {url} | {user} | {pwd} |')
 
     body = '\n'.join(lines)
-    fm   = '---\ntags: [passwords, imported]\n---\n'
+    fm   = '---\nid: ' + str(_uuid_mod.uuid4()) + '\ntags: [passwords, imported]\n---\n'
 
     safe = _sanitize_filename(title) or f'passwords_{int(time.time())}'
     nd   = paths.get_notes_dir()
@@ -1979,7 +3297,7 @@ def api_browser_import_csv():
         lines.append(f'| {url} | {user} | {pwd} |')
 
     body = '\n'.join(lines)
-    fm   = '---\ntags: [passwords, imported]\n---\n'
+    fm   = '---\nid: ' + str(_uuid_mod.uuid4()) + '\ntags: [passwords, imported]\n---\n'
 
     safe = _sanitize_filename(title) or f'passwords_{int(time.time())}'
     nd   = paths.get_notes_dir()
@@ -1997,6 +3315,8 @@ def api_browser_import_csv():
     return jsonify({'ok': True, 'count': count, 'note': note_name})
 
 
+# ---------------------------------------------------------------------------
+# (csv import fm already patched above)
 # ---------------------------------------------------------------------------
 # Notable import
 # ---------------------------------------------------------------------------
@@ -2107,7 +3427,9 @@ def import_notable():
             body = re.sub(r'\[@attachment/([^\]]+)\]', _repl_link, body)
 
             # Build output
-            fm_block = ('---\ntags: [' + ', '.join(tags) + ']\n---\n') if tags else ''
+            _nid     = str(_uuid_mod.uuid4())
+            fm_block = ('---\nid: ' + _nid + '\ntags: [' + ', '.join(tags) + ']\n---\n') if tags \
+                       else ('---\nid: ' + _nid + '\n---\n')
             content  = fm_block + body
 
             safe_name = _sanitize_notable_name(title)
