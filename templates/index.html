@@ -54,6 +54,15 @@
         </svg>
         <input type="search" id="search-input" placeholder="Search notes…"
                autocomplete="off" spellcheck="false" />
+        <button class="tool-btn search-new-btn" id="btn-new" title="New note">
+          <img src="{{ url_for('static', filename='images/plus.png') }}" alt="New note" />
+        </button>
+      </div>
+      <div id="sort-bar">
+        <button class="sort-btn" data-sort="ctime">Created</button>
+        <button class="sort-btn" data-sort="alpha">Alphabetic</button>
+        <button class="sort-btn" data-sort="mtime">Changed</button>
+        <span id="sort-direction"></span>
       </div>
       <ul id="note-list"></ul>
     </div>
@@ -65,21 +74,17 @@
 
       <div class="content-toolbar">
         <div class="toolbar-actions">
-          <button class="tool-btn" id="btn-new"   title="New note">
-            <img src="{{ url_for('static', filename='images/plus.png') }}"   alt="New note" />
-          </button>
+          <!-- Group 1: edit · tag -->
           <button class="tool-btn" id="btn-edit"  title="Edit">
             <img src="{{ url_for('static', filename='images/pencil.png') }}" alt="Edit" />
           </button>
           <button class="tool-btn" id="btn-tags"  title="Tags">
             <img src="{{ url_for('static', filename='images/tag.png') }}"    alt="Tags" />
           </button>
-          <button class="tool-btn" id="btn-trash" title="Move to Trash" disabled>
-            <img src="{{ url_for('static', filename='images/trash.png') }}"  alt="Trash" />
-          </button>
-          <button class="tool-btn" id="btn-lock"   title="Lock note" disabled>
-            <img src="{{ url_for('static', filename='images/lock.png') }}"   alt="Lock" />
-          </button>
+
+          <div class="tool-sep"></div>
+
+          <!-- Group 2: export · share -->
           <button class="tool-btn" id="btn-export" title="Export as PDF" disabled>
             <img src="{{ url_for('static', filename='images/export.png') }}" alt="Export" />
           </button>
@@ -88,6 +93,20 @@
               <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
               <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
             </svg>
+          </button>
+
+          <div class="tool-sep"></div>
+
+          <!-- Group 3: lock -->
+          <button class="tool-btn" id="btn-lock"   title="Lock note" disabled>
+            <img src="{{ url_for('static', filename='images/lock.png') }}"   alt="Lock" />
+          </button>
+
+          <div class="tool-sep"></div>
+
+          <!-- Group 4: trash -->
+          <button class="tool-btn" id="btn-trash" title="Move to Trash" disabled>
+            <img src="{{ url_for('static', filename='images/trash.png') }}"  alt="Trash" />
           </button>
         </div>
 
@@ -741,6 +760,17 @@
       </div><!-- /settings-right-panel -->
     </div><!-- /settings-dialog -->
   </div><!-- /settings-modal -->
+
+  <!-- "Send to trash?" confirmation dialog -->
+  <div id="send-to-trash-overlay" class="modal-overlay hidden">
+    <div class="confirm-dialog-box">
+      <p class="confirm-dialog-msg">Send to trash?</p>
+      <div class="confirm-dialog-actions">
+        <button id="send-to-trash-yes" class="confirm-btn confirm-btn-yes">Yes</button>
+        <button id="send-to-trash-no"  class="confirm-btn confirm-btn-no">No</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Lock / encrypt dialog -->
   <div id="encrypt-dialog" class="modal-overlay hidden">

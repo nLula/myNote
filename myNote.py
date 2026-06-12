@@ -246,18 +246,38 @@ def api_next_untitled():
 
 @app.route('/api/tags')
 def api_tags():
-    tags: set = set()
+    trash_view  = request.args.get('trash')  == '1'
+    want_counts = request.args.get('counts') == '1'
+    tag_counts: dict = {}
+    all_count   = 0
+    trash_count = 0
     for fp in _note_files():
-        for t in _read_frontmatter(fp).get('tags', []):
+        fm         = _read_frontmatter(fp)
+        is_trashed = TRASH_TAG in fm.get('tags', [])
+        if is_trashed:
+            trash_count += 1
+        else:
+            all_count += 1
+        if trash_view != is_trashed:
+            continue
+        for t in fm.get('tags', []):
             if t != TRASH_TAG:
-                tags.add(t)
-    return jsonify(sorted(tags))
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+    tags_sorted = sorted(tag_counts.keys())
+    if want_counts:
+        return jsonify({
+            'tags':        [{'name': t, 'count': tag_counts[t]} for t in tags_sorted],
+            'all_count':   all_count,
+            'trash_count': trash_count,
+        })
+    return jsonify(tags_sorted)
 
 
 @app.route('/api/notes')
 def api_notes():
-    tag = request.args.get('tag', '').strip()
-    names = []
+    tag          = request.args.get('tag', '').strip()
+    trash_filter = request.args.get('trash_filter', '').strip()
+    entries = []
     for fp in _note_files():
         fm         = _read_frontmatter(fp)
         fm_tags    = fm.get('tags', [])
@@ -265,14 +285,32 @@ def api_notes():
         if tag == TRASH_TAG:
             if not is_trashed:
                 continue
+            # Optional secondary tag filter within Trash view
+            if trash_filter and trash_filter not in fm_tags:
+                continue
         else:
             if is_trashed:
                 continue
             if tag and tag not in fm_tags:
                 continue
         name = os.path.splitext(os.path.basename(fp))[0]
-        names.append({'name': name, 'title': _extract_title(fp), 'encrypted': fm.get('encrypted', False)})
-    return jsonify(names)
+        entries.append({
+            'name':      name,
+            'title':     _extract_title(fp),
+            'encrypted': fm.get('encrypted', False),
+            '_ctime':    os.path.getctime(fp),
+            '_mtime':    os.path.getmtime(fp),
+        })
+    sort_by  = request.args.get('sort',  'ctime')   # ctime | alpha | mtime
+    sort_desc = request.args.get('order', 'desc') == 'desc'
+    if sort_by == 'alpha':
+        entries.sort(key=lambda e: e['title'].lower(), reverse=sort_desc)
+    elif sort_by == 'mtime':
+        entries.sort(key=lambda e: e['_mtime'], reverse=sort_desc)
+    else:  # ctime (default)
+        entries.sort(key=lambda e: e['_ctime'], reverse=sort_desc)
+    return jsonify([{k: v for k, v in e.items() if k.startswith('_') is False}
+                    for e in entries])
 
 
 @app.route('/api/search')
@@ -1098,8 +1136,10 @@ def get_settings():
     cfg = paths._load_config()
     s   = cfg.get('settings', {})
     return jsonify({
-        'email':           s.get('email', ''),
+        'email':            s.get('email', ''),
         'emailPasswordSet': bool(s.get('email_password', '')),
+        'sort_by':          s.get('sort_by',   'ctime'),
+        'sort_desc':        s.get('sort_desc',  True),
     })
 
 
@@ -1114,6 +1154,18 @@ def save_settings():
     pwd = data.get('emailPassword', '')
     if pwd:
         cfg['settings']['email_password'] = base64.b64encode(pwd.encode()).decode()
+    paths._save_config(cfg)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/prefs', methods=['POST'])
+def save_prefs():
+    """Save arbitrary UI preferences into config[settings]."""
+    data = request.get_json(force=True) or {}
+    cfg  = paths._load_config()
+    s    = cfg.setdefault('settings', {})
+    for key, val in data.items():
+        s[key] = val
     paths._save_config(cfg)
     return jsonify({'ok': True})
 
@@ -1293,6 +1345,17 @@ _TG_MAX_SEND  = 4000    # stay safely under Telegram's 4096-char hard limit
 # Invisible marker (U+200C ZERO WIDTH NON-JOINER) prepended to every reply we send.
 # Lets us skip our own bot replies on re-poll without blocking the user's own commands.
 _TG_REPLY_MARK = '‌'  # U+200C ZERO WIDTH NON-JOINER — invisible in Telegram UI
+
+# Claim-reply format: sent as a reply to the original message after downloading it.
+# Other myNote instances seeing this in their poll batch will skip that message.
+_TG_CLAIM_PREFIX = _TG_REPLY_MARK + '[myNote-claim:'
+_TG_CLAIM_SUFFIX = ']'
+
+def _tg_extract_claim_email(text: str) -> 'str | None':
+    """Return the owner e-mail if text is a claim marker, else None."""
+    if text.startswith(_TG_CLAIM_PREFIX) and text.endswith(_TG_CLAIM_SUFFIX):
+        return text[len(_TG_CLAIM_PREFIX):-len(_TG_CLAIM_SUFFIX)]
+    return None
 
 
 def _tg_find_note(search: str) -> 'tuple[str, str] | None':
@@ -1476,22 +1539,22 @@ async def _tg_process_message(client, msg) -> None:
     try:
         from telethon.tl.types import DocumentAttributeFilename
     except ImportError:
-        return
+        return False
 
     # Service messages (photo changed, user joined/left, pin, channel create, etc.)
     # have msg.action set to a non-None TL object. They carry no user content.
     if getattr(msg, 'action', None) is not None:
         _tg_log.debug('  skipped — service message (action=%s)', type(msg.action).__name__)
-        return
+        return False
 
     # msg.text applies the client's parse_mode and returns e.g. **bold** for bold entities.
     # msg.raw_text is always the plain string the user typed, with no markdown markup added.
     text  = (msg.raw_text or '').strip()
 
-    # Skip our own bot replies — they carry an invisible marker we prepended when sending.
+    # Skip our own bot replies and claim markers — they carry the invisible prefix.
     if text.startswith(_TG_REPLY_MARK):
-        _tg_log.debug('  skipped — our own get-reply (marker detected)')
-        return
+        _tg_log.debug('  skipped — bot/claim marker detected')
+        return False
 
     lines = text.split('\n') if text else []
     title = lines[0][:80].strip() if lines else _tg_ts_title()
@@ -1552,12 +1615,12 @@ async def _tg_process_message(client, msg) -> None:
                         int(_t.get('last_message_id', 0)), max_sent_id)
                     paths._save_config(_c)
                     _tg_log.debug('  watermark advanced to %d', max_sent_id)
-        return  # do not create a note from the command message
+        return False  # do not create a note from the command message
 
     # Skip entirely empty messages (no text, no media — nothing to save)
     if not text and not msg.photo and not msg.document:
         _tg_log.debug('  skipped — no text and no media')
-        return
+        return False
 
     media_md = ''
 
@@ -1600,6 +1663,7 @@ async def _tg_process_message(client, msg) -> None:
             _tg_log.error('  document download failed: %s', e, exc_info=True)
 
     _tg_create_note(title, body + media_md)   # logs "appended" or "new note created" itself
+    return True
 
 
 # Event that allows the settings-save route to wake the poll thread immediately
@@ -1721,21 +1785,65 @@ def _telegram_user_poll_loop() -> None:
                         'verify the ID in Settings → Telegram', chat_id)
                     return
 
-                last_id  = int(paths._load_config().get('telegram', {})
-                               .get('last_message_id', 0))
-                _tg_log.debug('Polling chat=%s  min_id=%s', chat_id, last_id)
-                messages = await client.get_messages(target_entity, limit=50, min_id=last_id)
-                msg_list = list(reversed(list(messages)))
+                full_cfg  = paths._load_config()
+                owner_email = full_cfg.get('settings', {}).get('email', '').strip().lower()
+                last_id   = int(full_cfg.get('telegram', {}).get('last_message_id', 0))
+                _tg_log.debug('Polling chat=%s  min_id=%s  owner=%s', chat_id, last_id, owner_email or '(none)')
+                messages  = await client.get_messages(target_entity, limit=50, min_id=last_id)
+                msg_list  = list(reversed(list(messages)))
                 _tg_log.info('Fetched %d new message(s) from chat %s', len(msg_list), chat_id)
+
+                # ── Pass 1: build claim index from this batch ─────────────────
+                # Claim messages are invisible replies sent by any myNote instance
+                # after downloading a note.  Format: _TG_CLAIM_PREFIX + email + _TG_CLAIM_SUFFIX
+                # claimed[original_msg_id] = set of owner emails that already took it
+                claimed: dict = {}
+                for _m in msg_list:
+                    _txt   = (_m.raw_text or '').strip()
+                    _email = _tg_extract_claim_email(_txt)
+                    if _email:
+                        _rid = getattr(getattr(_m, 'reply_to', None), 'reply_to_msg_id', None)
+                        if _rid:
+                            claimed.setdefault(_rid, set()).add(_email.lower())
+
+                # ── Pass 2: process regular messages ─────────────────────────
                 for msg in msg_list:
                     _tg_log.debug('Processing msg id=%s', msg.id)
-                    try:
-                        await _tg_process_message(client, msg)
-                    except Exception as e:
-                        _tg_log.error('Error processing msg id=%s: %s', msg.id, e, exc_info=True)
+
+                    # Skip if this owner already claimed the note in this batch
+                    if owner_email and msg.id in claimed and owner_email in claimed[msg.id]:
+                        _tg_log.info('  msg id=%s already claimed by %s — skipping',
+                                     msg.id, owner_email)
+                    else:
+                        try:
+                            note_created = await _tg_process_message(client, msg)
+                        except Exception as e:
+                            _tg_log.error('Error processing msg id=%s: %s', msg.id, e, exc_info=True)
+                            note_created = False
+
+                        # After a successful note download, reply with a claim marker so
+                        # other myNote instances with the same owner email skip this message.
+                        if note_created and owner_email:
+                            claim_text = _TG_CLAIM_PREFIX + owner_email + _TG_CLAIM_SUFFIX
+                            try:
+                                sent_claim = await client.send_message(
+                                    target_entity, claim_text, reply_to=msg.id)
+                                # Advance watermark past the claim reply so we never
+                                # re-ingest it as a note in a future poll cycle.
+                                _cc = paths._load_config()
+                                _ct = _cc.setdefault('telegram', {})
+                                _ct['last_message_id'] = max(
+                                    int(_ct.get('last_message_id', 0)), sent_claim.id)
+                                paths._save_config(_cc)
+                                _tg_log.info('  claim sent for msg id=%s (owner: %s)',
+                                             msg.id, owner_email)
+                            except Exception as ec:
+                                _tg_log.error('  could not send claim for msg id=%s: %s',
+                                              msg.id, ec)
+
                     c = paths._load_config()
                     t = c.setdefault('telegram', {})
-                    # Use max() so an advanced watermark set by a get-reply is never rolled back
+                    # Use max() so an advanced watermark is never rolled back
                     t['last_message_id'] = max(int(t.get('last_message_id', 0)), msg.id)
                     paths._save_config(c)
             finally:
@@ -2373,6 +2481,76 @@ def _detect_icloud_drive() -> 'str | None':
     return None
 
 
+def _has_notes_structure(path: str) -> bool:
+    """Return True if *path* already looks like a myNote sync folder.
+
+    Canonical layout: ``.md`` files and ``.deletions.json`` sit directly in
+    *path*; attachments live in ``path/attachments/``.  We also accept the
+    legacy ``notes/`` sub-directory layout so that setup can recognise an
+    existing remote without creating a conflicting second folder (migration
+    to the flat layout happens automatically on the first sync).
+    """
+    if not os.path.isdir(path):
+        return False
+    # New flat layout: has attachments/ subdir
+    if os.path.isdir(os.path.join(path, 'attachments')):
+        return True
+    # Legacy layout: notes stored in a notes/ subfolder (will be migrated on sync)
+    if os.path.isdir(os.path.join(path, 'notes')):
+        return True
+    # Fallback: any .md file directly inside
+    try:
+        return any(
+            f.lower().endswith('.md')
+            for f in os.listdir(path)
+            if os.path.isfile(os.path.join(path, f))
+        )
+    except OSError:
+        return False
+
+
+def _migrate_remote_notes_subdir(remote_root: str, log) -> None:
+    """Flatten the legacy ``notes/`` subfolder into ``remote_root/``.
+
+    Old layout: ``remote_root/notes/*.md`` and
+                ``remote_root/notes/.deletions.json``
+    New layout: ``remote_root/*.md`` and
+                ``remote_root/.deletions.json``
+
+    Runs automatically before every sync so no user action is needed.
+    Files that already exist in the destination are kept if they are newer;
+    the old copy is discarded otherwise.  The empty ``notes/`` dir is
+    removed after migration.
+    """
+    notes_sub = os.path.join(remote_root, 'notes')
+    if not os.path.isdir(notes_sub):
+        return
+    moved = 0
+    for fname in os.listdir(notes_sub):
+        src = os.path.join(notes_sub, fname)
+        if not os.path.isfile(src):
+            continue                        # skip subdirs
+        dst = os.path.join(remote_root, fname)
+        try:
+            if os.path.exists(dst):
+                if os.path.getmtime(src) > os.path.getmtime(dst):
+                    os.replace(src, dst)    # remote copy is newer — overwrite
+                else:
+                    os.remove(src)          # local copy is newer — discard remote
+            else:
+                shutil.move(src, dst)
+            moved += 1
+        except OSError as exc:
+            log.warning('migrate: could not move %s → %s: %s', src, dst, exc)
+    if moved:
+        log.info('Migrated %d file(s) from legacy notes/ subdir at %s', moved, remote_root)
+    try:
+        os.rmdir(notes_sub)                 # only succeeds when dir is now empty
+        log.info('Removed empty legacy notes/ subdir at %s', remote_root)
+    except OSError:
+        pass                                # not empty yet — leave it
+
+
 def _icloud_sync_dirs(local_dir: str, remote_dir: str,
                       *, recursive: bool = False,
                       exts: 'set | None' = None) -> dict:
@@ -2439,10 +2617,15 @@ def _icloud_do_sync() -> dict:
         return {'ok': False, 'error': 'iCloud Drive path not found or not accessible.'}
 
     remote_root   = os.path.join(drive, folder)
-    remote_notes  = os.path.join(remote_root, 'notes')
     remote_attach = os.path.join(remote_root, 'attachments')
     local_notes   = paths.get_notes_dir()
     local_attach  = paths.get_attachments_dir()
+
+    # Flatten legacy notes/ subfolder into remote_root before syncing
+    _migrate_remote_notes_subdir(remote_root, _icloud_log)
+
+    # Notes live directly in remote_root (same flat layout as local)
+    remote_notes  = remote_root
 
     try:
         with _icloud_sync_lock:
@@ -2544,14 +2727,26 @@ def icloud_setup():
                         'error': f'Folder not found: {drive}\n'
                                   'Make sure iCloud for Windows is installed and signed in.'})
     try:
-        remote_root = os.path.join(drive, folder)
-        for sub in ['notes',
-                    os.path.join('attachments', 'images'),
-                    os.path.join('attachments', 'documents'),
-                    os.path.join('attachments', 'archives'),
-                    os.path.join('attachments', 'videos')]:
-            os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
-        _icloud_log.info('Folder structure created at %s', remote_root)
+        remote_root  = os.path.join(drive, folder)
+        attach_subs  = [
+            os.path.join('attachments', 'images'),
+            os.path.join('attachments', 'documents'),
+            os.path.join('attachments', 'archives'),
+            os.path.join('attachments', 'videos'),
+        ]
+        if _has_notes_structure(remote_root):
+            # Folder already exists — only fill in any missing attachment subdirs.
+            # Do NOT create notes/ or any other top-level dir that might trigger
+            # a cloud-client conflict-rename (myNotes → myNotes(1)).
+            for sub in attach_subs:
+                os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
+            _icloud_log.info('Using existing folder structure at %s', remote_root)
+        else:
+            # Fresh folder — notes go directly in remote_root (flat layout)
+            os.makedirs(remote_root, exist_ok=True)
+            for sub in attach_subs:
+                os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
+            _icloud_log.info('Folder structure created at %s', remote_root)
 
         cfg = paths._load_config()
         c   = cfg.setdefault('icloud', {})
@@ -2679,10 +2874,15 @@ def _gdrive_do_sync() -> dict:
         return {'ok': False, 'error': 'Google Drive path not found or not accessible.'}
 
     remote_root   = os.path.join(drive, folder)
-    remote_notes  = os.path.join(remote_root, 'notes')
     remote_attach = os.path.join(remote_root, 'attachments')
     local_notes   = paths.get_notes_dir()
     local_attach  = paths.get_attachments_dir()
+
+    # Flatten legacy notes/ subfolder into remote_root before syncing
+    _migrate_remote_notes_subdir(remote_root, _gdrive_log)
+
+    # Notes live directly in remote_root (same flat layout as local)
+    remote_notes  = remote_root
 
     try:
         with _gdrive_sync_lock:
@@ -2761,14 +2961,26 @@ def gdrive_setup():
                         'error': f'Folder not found: {drive}\n'
                                   'Make sure Google Drive for Desktop is installed and signed in.'})
     try:
-        remote_root = os.path.join(drive, folder)
-        for sub in ['notes',
-                    os.path.join('attachments', 'images'),
-                    os.path.join('attachments', 'documents'),
-                    os.path.join('attachments', 'archives'),
-                    os.path.join('attachments', 'videos')]:
-            os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
-        _gdrive_log.info('Folder structure created at %s', remote_root)
+        remote_root  = os.path.join(drive, folder)
+        attach_subs  = [
+            os.path.join('attachments', 'images'),
+            os.path.join('attachments', 'documents'),
+            os.path.join('attachments', 'archives'),
+            os.path.join('attachments', 'videos'),
+        ]
+        if _has_notes_structure(remote_root):
+            # Folder already exists — only fill in any missing attachment subdirs.
+            # Do NOT create notes/ or any other top-level dir that might trigger
+            # a cloud-client conflict-rename (myNotes → myNotes(1)).
+            for sub in attach_subs:
+                os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
+            _gdrive_log.info('Using existing folder structure at %s', remote_root)
+        else:
+            # Fresh folder — notes go directly in remote_root (flat layout)
+            os.makedirs(remote_root, exist_ok=True)
+            for sub in attach_subs:
+                os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
+            _gdrive_log.info('Folder structure created at %s', remote_root)
 
         cfg = paths._load_config()
         c   = cfg.setdefault('gdrive', {})

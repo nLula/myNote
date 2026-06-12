@@ -138,6 +138,11 @@ let activeTag        = '';
 let activeNote       = '';
 let activeButton     = null;
 let searchQuery      = '';
+let trashTagFilter   = '';   // secondary tag filter when browsing Trash
+let lockedGroupExpanded = false;
+let lockedCollapseTimer = null;
+let sortBy   = 'ctime';   // ctime | alpha | mtime
+let sortDesc = true;      // true = descending
 let searchTimer      = null;
 let selectedNotes        = new Set();   // Ctrl-multi-selected note names
 let multiSelectAnchor    = '';          // last plain/ctrl-click — Shift range starts here
@@ -269,6 +274,7 @@ function startAutoLockTimer() {
     if (noteEncrypted && activeNote) {
       enterViewMode();
       updateExportButton();
+      updateEditTagButtons();
     }
   }, 60000);
 }
@@ -285,6 +291,15 @@ function updateShareButton() {
   // Share is available for any open non-encrypted note
   const btn = document.getElementById('btn-share');
   btn.disabled = !activeNote || noteEncrypted;
+}
+
+function updateEditTagButtons() {
+  // Edit and Tags are disabled when: no note open, in Trash view, or note is locked
+  const off = !activeNote
+    || activeTag === TRASH_TAG
+    || (noteEncrypted && !notePasswords.has(activeNote));
+  document.getElementById('btn-edit').disabled = off;
+  document.getElementById('btn-tags').disabled = off;
 }
 
 // ── Multi-select ────────────────────────────────────────────────────────────
@@ -603,21 +618,35 @@ document.getElementById('search-input').addEventListener('search', e => {
 
 // ── Tags (col 1) ───────────────────────────────────────────────────────────
 
-async function renderTags() {
-  const tags = await api('/api/tags');
-  allTagsCache = tags;
+async function renderTags(forTrash = false) {
+  const data = await api(forTrash ? '/api/tags?trash=1&counts=1' : '/api/tags?counts=1');
+  // data = { tags: [{name, count}], all_count, trash_count }
+  if (!forTrash) allTagsCache = data.tags.map(t => t.name);
+
   const list = document.getElementById('tag-list');
   list.innerHTML = '';
-  [{ label: 'All', value: '', system: true },
-   ...tags.map(t => ({ label: t, value: t, system: false })),
-   { label: 'Trash', value: TRASH_TAG, system: true }
-  ].forEach(({ label, value, system }) => {
+
+  [
+    { label: 'All',   value: '',        system: true,  count: data.all_count   },
+    ...data.tags.map(t => ({ label: t.name, value: t.name, system: false, count: t.count })),
+    { label: 'Trash', value: TRASH_TAG, system: true,  count: data.trash_count },
+  ].forEach(({ label, value, system, count }) => {
     const li = document.createElement('li');
     li.className = 'tag-item'
-      + (system        ? ' tag-system' : '')
-      + (activeTag === value ? ' active'     : '');
-    li.textContent = label;
+      + (system          ? ' tag-system' : '')
+      + (activeTag === value ? ' active' : '');
     li.dataset.tag = value;
+
+    const labelSpan = document.createElement('span');
+    labelSpan.className = 'tag-item-label';
+    labelSpan.textContent = label;
+    li.appendChild(labelSpan);
+
+    const badge = document.createElement('span');
+    badge.className = 'tag-item-count';
+    badge.textContent = count;
+    li.appendChild(badge);
+
     li.addEventListener('click', () => selectTag(value));
     list.appendChild(li);
   });
@@ -631,6 +660,21 @@ function _isNewReservedTag(tagName) {
 }
 
 async function selectTag(tag) {
+  // While in Trash view, clicking a user tag filters within Trash instead of
+  // navigating away to the main notes list.
+  if (activeTag === TRASH_TAG && tag !== TRASH_TAG && tag !== '') {
+    trashTagFilter = tag;
+    document.querySelectorAll('.tag-item').forEach(el =>
+      el.classList.toggle('active', el.dataset.tag === tag));
+    await renderNotes();
+    return;
+  }
+
+  // Normal navigation — always reset the trash sub-filter and locked group.
+  trashTagFilter = '';
+  lockedGroupExpanded = false;
+  clearTimeout(lockedCollapseTimer);
+  lockedCollapseTimer = null;
   clearTimeout(saveTimer);
   if (activeNote && noteEncrypted && notePasswords.has(activeNote)) {
     notePasswords.delete(activeNote);
@@ -641,18 +685,43 @@ async function selectTag(tag) {
   activeTag = tag; activeNote = ''; searchQuery = '';
   document.getElementById('search-input').value = '';
   clearContentPane();
-  document.querySelectorAll('.tag-item').forEach(el =>
-    el.classList.toggle('active', el.dataset.tag === tag));
+  await renderTags(tag === TRASH_TAG);
   updateToolbarState();
   await renderNotes();
+}
+
+// ── Locked group helpers ────────────────────────────────────────────────────
+
+function _resetLockedCollapseTimer() {
+  clearTimeout(lockedCollapseTimer);
+  lockedCollapseTimer = setTimeout(() => {
+    lockedGroupExpanded = false;
+    renderNotes();
+  }, 5 * 60 * 1000);
+}
+
+function _collapseLockedGroup() {
+  clearTimeout(lockedCollapseTimer);
+  lockedCollapseTimer = null;
+  lockedGroupExpanded = false;
+  renderNotes();
 }
 
 // ── Notes (col 2) ──────────────────────────────────────────────────────────
 
 async function renderNotes() {
-  let url = searchQuery
-    ? `/api/search?q=${encodeURIComponent(searchQuery)}` + (activeTag ? `&tag=${encodeURIComponent(activeTag)}` : '')
-    : (activeTag ? `/api/notes?tag=${encodeURIComponent(activeTag)}` : '/api/notes');
+  const sortParams = `sort=${sortBy}&order=${sortDesc ? 'desc' : 'asc'}`;
+  let url;
+  if (searchQuery) {
+    // Search results are not re-sorted server-side (full-text scores govern order)
+    url = `/api/search?q=${encodeURIComponent(searchQuery)}` + (activeTag ? `&tag=${encodeURIComponent(activeTag)}` : '');
+  } else if (activeTag === TRASH_TAG && trashTagFilter) {
+    url = `/api/notes?tag=${encodeURIComponent(TRASH_TAG)}&trash_filter=${encodeURIComponent(trashTagFilter)}&${sortParams}`;
+  } else if (activeTag) {
+    url = `/api/notes?tag=${encodeURIComponent(activeTag)}&${sortParams}`;
+  } else {
+    url = `/api/notes?${sortParams}`;
+  }
 
   const items = await api(url);
   const list  = document.getElementById('note-list');
@@ -664,31 +733,50 @@ async function renderNotes() {
     list.appendChild(li);
     return;
   }
-  items.forEach(({ name, title, encrypted }) => {
+  const unlockedNotes = items.filter(n => !n.encrypted);
+  const lockedNotes   = items.filter(n =>  n.encrypted);
+
+  // Auto-expand the locked group when the active note is inside it
+  if (lockedNotes.length && activeNote && lockedNotes.some(n => n.name === activeNote)) {
+    lockedGroupExpanded = true;
+  }
+
+  // Build a note list item and attach the standard click handler.
+  // lockIconClick — optional extra handler bound to the lock icon (stop-propagated).
+  function makeNoteItem(name, title, encrypted, lockIconClick) {
     const li = document.createElement('li');
     li.className = 'note-item' + (activeNote === name ? ' active' : '');
     li.dataset.name = name;
+
     const lockImg = document.createElement('img');
     lockImg.className = 'note-lock-icon' + (encrypted ? '' : ' hidden');
     lockImg.src = '/static/images/lock.png';
     lockImg.alt = '';
+    if (lockIconClick) {
+      lockImg.addEventListener('click', e => { e.stopPropagation(); lockIconClick(); });
+    }
+
     const textSpan = document.createElement('span');
     textSpan.className = 'note-item-text';
     textSpan.textContent = title;
     li.appendChild(lockImg);
     li.appendChild(textSpan);
+
     li.addEventListener('click', e => {
+      // Always read data-name at click time — saveAndRename patches it after a
+      // rename, so the closure value of `name` may be stale.
+      const currentName = li.dataset.name;
+
       if (e.shiftKey && multiSelectAnchor) {
         // ── Shift-click: select every note between anchor and here ──
-        e.preventDefault();   // don't let the browser text-select the list
+        e.preventDefault();
         const order = Array.from(
           document.querySelectorAll('#note-list .note-item:not(.empty)')
         ).map(el => el.dataset.name).filter(Boolean);
 
         const ai = order.indexOf(multiSelectAnchor);
-        const bi = order.indexOf(name);
+        const bi = order.indexOf(currentName);
         if (ai !== -1 && bi !== -1) {
-          // Seed with the currently open note if nothing is selected yet
           if (selectedNotes.size === 0 && activeNote) selectedNotes.add(activeNote);
           const [from, to] = ai <= bi ? [ai, bi] : [bi, ai];
           for (let i = from; i <= to; i++) selectedNotes.add(order[i]);
@@ -705,37 +793,88 @@ async function renderNotes() {
 
       } else if (e.ctrlKey) {
         // ── Ctrl-click: toggle this note in the multi-selection ──
-        // Seed the set with the currently active note on first ctrl-click
         if (selectedNotes.size === 0 && activeNote) selectedNotes.add(activeNote);
-        if (selectedNotes.has(name)) selectedNotes.delete(name);
-        else                         selectedNotes.add(name);
+        if (selectedNotes.has(currentName)) selectedNotes.delete(currentName);
+        else                                selectedNotes.add(currentName);
 
-        multiSelectAnchor = name;   // update anchor for future Shift-ranges
+        multiSelectAnchor = currentName;
 
         if (selectedNotes.size >= 2) {
           activeNote = '';
           enterMultiSelectMode();
         } else if (selectedNotes.size === 1) {
-          // Dropped back to 1 — just open that note normally
           const only = [...selectedNotes][0];
           clearMultiSelect();
           setActiveButton(null);
           openNote(only);
         } else {
-          // Empty selection — just clear
           clearMultiSelect();
         }
 
       } else {
-        // ── Normal click: clear any multi-select then open ──
-        multiSelectAnchor = name;   // reset anchor
+        // ── Normal click ──
+        multiSelectAnchor = currentName;
         clearMultiSelect();
         setActiveButton(null);
-        openNote(name);
+        if (encrypted) _resetLockedCollapseTimer();
+        openNote(currentName);
       }
     });
-    list.appendChild(li);
+    return li;
+  }
+
+  // Render unlocked notes
+  unlockedNotes.forEach(({ name, title, encrypted }) => {
+    list.appendChild(makeNoteItem(name, title, encrypted));
   });
+
+  // Render locked group
+  if (lockedNotes.length) {
+    const header = document.createElement('li');
+    header.className = 'note-group-header locked-group-header';
+
+    const hLock = document.createElement('img');
+    hLock.src   = '/static/images/lock.png';
+    hLock.alt   = '';
+    hLock.className = 'note-lock-icon';
+
+    const hText = document.createElement('span');
+    hText.className = 'locked-group-label';
+    hText.textContent = 'Locked';
+
+    const hCount = document.createElement('span');
+    hCount.className = 'locked-group-count';
+    hCount.textContent = lockedNotes.length;
+
+    const hChevron = document.createElement('span');
+    hChevron.className = 'locked-group-chevron';
+    hChevron.textContent = lockedGroupExpanded ? '▾' : '▸';
+
+    header.appendChild(hLock);
+    header.appendChild(hText);
+    header.appendChild(hCount);
+    header.appendChild(hChevron);
+
+    header.addEventListener('click', () => {
+      if (lockedGroupExpanded) {
+        _collapseLockedGroup();
+      } else {
+        lockedGroupExpanded = true;
+        _resetLockedCollapseTimer();
+        renderNotes();
+      }
+    });
+
+    list.appendChild(header);
+
+    if (lockedGroupExpanded) {
+      lockedNotes.forEach(({ name, title, encrypted }) => {
+        const el = makeNoteItem(name, title, encrypted);
+        el.dataset.lockedGroupItem = '1';
+        list.appendChild(el);
+      });
+    }
+  }
 }
 
 // ── Open note (col 3) ──────────────────────────────────────────────────────
@@ -790,6 +929,7 @@ async function openNote(name, startEditing = false) {
   }
   if (noteEncrypted && notePasswords.has(name)) startAutoLockTimer();
   updateExportButton();
+  updateEditTagButtons();
 }
 
 // ── Toolbar state ───────────────────────────────────────────────────────────
@@ -799,6 +939,7 @@ function updateToolbarState() {
   document.getElementById('btn-trash').title =
     inTrash ? 'Restore from Trash' : 'Move to Trash';
   document.querySelector('.content-toolbar').classList.toggle('trash-mode', inTrash);
+  document.getElementById('btn-new').disabled = inTrash;
 }
 
 // ── Lock / encrypt dialog ──────────────────────────────────────────────────
@@ -888,6 +1029,7 @@ document.getElementById('encrypt-ok').addEventListener('click', async () => {
       enterViewMode();
       startAutoLockTimer();
       updateExportButton();
+      updateEditTagButtons();
       console.debug('[unlock] success, plaintext length:', plain.length);
     } catch (err) {
       console.error('[unlock] decryptText threw:', err.name, err.message);
@@ -1033,14 +1175,16 @@ let workfolderConfigured = false;
  * The button stays disabled until the user changes something from the baseline.
  */
 function makeDirtyTracker(saveBtn, fields) {
-  let baseline = null;
+  let baseline   = null;
+  let forceDirty = false;   // overrides diff logic — button stays active until markClean()
 
   function snapshot() {
     return fields.map(f => (f.type === 'checkbox' ? String(f.checked) : f.value));
   }
 
   function refresh() {
-    if (baseline === null) { saveBtn.disabled = true; return; }
+    if (forceDirty)          { saveBtn.disabled = false; return; }
+    if (baseline === null)   { saveBtn.disabled = true;  return; }
     saveBtn.disabled = snapshot().every((v, i) => v === baseline[i]);
   }
 
@@ -1052,8 +1196,11 @@ function makeDirtyTracker(saveBtn, fields) {
   saveBtn.disabled = true;
 
   return {
-    setBaseline() { baseline = snapshot(); saveBtn.disabled = true; },
-    markClean()   { baseline = snapshot(); saveBtn.disabled = true; },
+    setBaseline() { forceDirty = false; baseline = snapshot(); saveBtn.disabled = true; },
+    markClean()   { forceDirty = false; baseline = snapshot(); saveBtn.disabled = true; },
+    // Force the button active regardless of baseline (e.g. first-time setup with unsaved data).
+    // Any subsequent field change still triggers refresh(); button stays active until markClean().
+    markDirty()   { forceDirty = true;  saveBtn.disabled = false; },
   };
 }
 
@@ -1352,6 +1499,9 @@ document.getElementById('settings-tg-connect-btn').addEventListener('click', () 
   document.getElementById('tg-connected-channel-id').textContent = chatId;
   tgSetStatus('settings-tg-status-conn', '');
   tgSetStep('connected');
+  // First-time channel entry: no saved baseline yet — force Save active so the
+  // user can persist the channel ID.  markClean() after a successful save resets this.
+  _tgDirty.markDirty();
 });
 
 // Step 4 — change channel (go back to step 3)
@@ -2190,7 +2340,7 @@ async function closeTagPopover(saveInput = true) {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tags: editingTags }),
     });
-    await renderTags();
+    await renderTags(activeTag === TRASH_TAG);
   }
   setActiveButton(null);
   _flushPendingUpdate();
@@ -2235,8 +2385,49 @@ document.addEventListener('mousedown', async e => {
 
 // ── TRASH ───────────────────────────────────────────────────────────────────
 
+// Returns a Promise that resolves true (Yes) or false (No/dismiss).
+function confirmTrash() {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('send-to-trash-overlay');
+    overlay.classList.remove('hidden');
+
+    let settled = false;
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      overlay.classList.add('hidden');
+      resolve(result);
+    }
+
+    document.getElementById('send-to-trash-yes').addEventListener('click', e => {
+      e.stopPropagation();
+      finish(true);
+    }, { once: true });
+
+    document.getElementById('send-to-trash-no').addEventListener('click', e => {
+      e.stopPropagation();
+      finish(false);
+    }, { once: true });
+
+    // Defer the backdrop-dismiss listener to the next event-loop task so the
+    // click that opened this dialog (still propagating right now) can't
+    // immediately close it.
+    setTimeout(() => {
+      overlay.addEventListener('click', e => {
+        if (e.target === overlay) finish(false);
+      }, { once: true });
+    }, 0);
+  });
+}
+
 document.getElementById('btn-trash').addEventListener('click', async () => {
-  const endpoint = activeTag === TRASH_TAG ? 'restore' : 'trash';
+  const inTrash  = activeTag === TRASH_TAG;
+  const endpoint = inTrash ? 'restore' : 'trash';
+
+  if (!inTrash) {
+    const confirmed = await confirmTrash();
+    if (!confirmed) return;
+  }
 
   if (selectedNotes.size >= 2) {
     // ── Multi-select: trash / restore every selected note ──
@@ -2251,7 +2442,7 @@ document.getElementById('btn-trash').addEventListener('click', async () => {
     activeNote = '';
     setActiveButton(null);
     clearContentPane();
-    await renderTags();
+    await renderTags(activeTag === TRASH_TAG);
     await renderNotes();
     return;
   }
@@ -2268,8 +2459,22 @@ document.getElementById('btn-trash').addEventListener('click', async () => {
   setActiveButton(null);
   clearContentPane();
   document.querySelectorAll('.note-item').forEach(el => el.classList.remove('active'));
-  await renderTags();
+  await renderTags(activeTag === TRASH_TAG);
   await renderNotes();
+});
+
+// ── Collapse locked group on outside click ──────────────────────────────────
+// When expanded but no note is currently session-unlocked, any click that
+// isn't on the group header or one of its expanded items collapses the group.
+
+document.addEventListener('click', e => {
+  if (!lockedGroupExpanded) return;
+  if (!document.getElementById('send-to-trash-overlay').classList.contains('hidden')) return;
+  if (e.target.closest('.locked-group-header')) return;
+  if (e.target.closest('[data-locked-group-item]')) return;
+  if (e.target.closest('#sort-bar')) return;
+  if (e.target.closest('.col-search-bar')) return;
+  _collapseLockedGroup();
 });
 
 // ── Global Escape ───────────────────────────────────────────────────────────
@@ -2291,6 +2496,16 @@ document.addEventListener('keydown', async e => {
     if (activeNote) await saveCurrentNote();
     enterViewMode();
     setActiveButton(null);
+    return;
+  }
+  if (activeNote) {
+    const wasLocked = noteEncrypted;
+    clearMultiSelect();
+    activeNote = '';
+    setActiveButton(null);
+    clearContentPane();
+    document.querySelectorAll('.note-item').forEach(el => el.classList.remove('active'));
+    if (wasLocked) _collapseLockedGroup();
   }
 });
 
@@ -2419,7 +2634,7 @@ function _isEditingActive() {
 }
 
 function _applyNotesUpdate(ev) {
-  renderTags().then(() => renderNotes()).then(() => {
+  renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(() => {
     if (!ev || !ev.appended || !ev.name) return;
     const noteName = ev.name.replace(/\.md$/i, '');
     const item = Array.from(document.querySelectorAll('.note-item'))
@@ -2661,8 +2876,11 @@ function _handleNotesUpdated(ev) {
         ? `Deleted ${data.deleted} note${data.deleted !== 1 ? 's' : ''}`
         : 'Trash already empty';
       setTimeout(() => { status.textContent = ''; }, 3000);
-      // Refresh note list if any notes were removed
-      if (data.deleted) refreshNoteList();
+      // Refresh tag + note lists if any notes were removed
+      if (data.deleted) {
+        await renderTags(activeTag === TRASH_TAG);
+        await renderNotes();
+      }
     } catch {
       status.textContent = 'Error';
     } finally {
@@ -2727,6 +2945,52 @@ window.addEventListener('pywebviewready', function () {
 
 });
 
+// ── Sort bar ───────────────────────────────────────────────────────────────
+
+function renderSortBar() {
+  document.querySelectorAll('.sort-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.sort === sortBy);
+  });
+  document.getElementById('sort-direction').textContent = sortDesc ? '↓' : '↑';
+}
+
+async function _saveSortPrefs() {
+  try {
+    await api('/api/prefs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sort_by: sortBy, sort_desc: sortDesc }),
+    });
+  } catch (_) {}
+}
+
+document.querySelectorAll('.sort-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const clicked = btn.dataset.sort;
+    if (clicked === sortBy) {
+      // Same option — toggle direction
+      sortDesc = !sortDesc;
+    } else {
+      sortBy = clicked;
+      // Keep current direction when switching option
+    }
+    renderSortBar();
+    await _saveSortPrefs();
+    await renderNotes();
+  });
+});
+
 // ── Init ───────────────────────────────────────────────────────────────────
 
-renderTags().then(() => renderNotes()).then(() => checkWorkfolder());
+(async () => {
+  // Load saved sort preference before first render
+  try {
+    const prefs = await api('/api/settings');
+    if (prefs.sort_by)              sortBy   = prefs.sort_by;
+    if (prefs.sort_desc !== undefined) sortDesc = prefs.sort_desc;
+  } catch (_) {}
+  renderSortBar();
+  await renderTags();
+  await renderNotes();
+  await checkWorkfolder();
+})();
