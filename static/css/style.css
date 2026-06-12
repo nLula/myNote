@@ -192,16 +192,7 @@ html.webview-app .app          { height: calc(100vh - 32px); }
 /* New-note button inside the search bar */
 .search-new-btn {
   flex-shrink: 0;
-  width: 24px;
-  height: 24px;
-  padding: 3px;
-  border-radius: 5px;
-  opacity: 0.6;
-  transition: opacity 0.15s, background 0.15s;
 }
-.search-new-btn:hover  { opacity: 1; background: var(--bg-hover); }
-.search-new-btn:disabled { opacity: 0.2; cursor: default; }
-.search-new-btn img { width: 14px; height: 14px; }
 
 /* ── Sort bar (below search bar in col-notes) ─────────────────────────────── */
 
@@ -347,7 +338,6 @@ html.webview-app .app          { height: calc(100vh - 32px); }
   gap: 1px;
   overflow: hidden;
   padding: 0 8px;
-  pointer-events: none;
 }
 
 .note-title span {
@@ -575,6 +565,68 @@ body.dragging .col-handle { background: var(--accent); }
 .note-group-header.locked-group-header:hover {
   color: var(--text-primary);
 }
+
+/* Alpha group headers (alphabetic sort, 6+ notes per letter) */
+.note-group-header.alpha-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px 5px;
+  margin-top: 6px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+}
+.note-group-header.alpha-group-header:hover { color: var(--text-primary); }
+.note-group-header.alpha-group-header.first { margin-top: 0; border-top: none; }
+.alpha-group-label   { flex: 1; }
+.alpha-group-count   { font-size: 10px; font-weight: 500; background: var(--bg-hover); border-radius: 8px; padding: 1px 6px; color: var(--text-muted); }
+.alpha-group-chevron { font-size: 10px; margin-left: 2px; color: var(--text-muted); }
+
+/* ── Note history tooltip ─────────────────────────────────────────────────── */
+#note-history-tooltip {
+  position: fixed;
+  z-index: 9999;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 9px 13px;
+  pointer-events: none;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+#note-history-tooltip.hidden { display: none; }
+.ht-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.8;
+  white-space: nowrap;
+}
+.ht-label {
+  color: var(--text-muted);
+  min-width: 120px;
+}
+.ht-date {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.ht-via {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.ht-last {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
 .locked-group-label {
   flex: 1;
 }
@@ -609,7 +661,7 @@ body.dragging .col-handle { background: var(--accent); }
     background-color: rgba(201, 100, 66, 0);
   }
   50% {
-    box-shadow: inset 0 0 0 2px #7A9E78;
+    box-shadow: inset 0 0 0 2px rgba(201, 100, 66, 0.75);
     background-color: rgba(201, 100, 66, 0.18);
   }
 }

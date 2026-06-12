@@ -137,10 +137,12 @@ const RESERVED_TAGS  = ['Telegram'];
 let activeTag        = '';
 let activeNote       = '';
 let activeButton     = null;
+let _isCreatingNote  = false;
 let searchQuery      = '';
 let trashTagFilter   = '';   // secondary tag filter when browsing Trash
 let lockedGroupExpanded = false;
 let lockedCollapseTimer = null;
+let alphaGroupExpanded  = new Set(); // letter keys of expanded alpha groups
 let sortBy   = 'ctime';   // ctime | alpha | mtime
 let sortDesc = true;      // true = descending
 let searchTimer      = null;
@@ -413,7 +415,7 @@ function stripEmptyFrontmatter(fm) {
 
 // ── Save + rename ──────────────────────────────────────────────────────────
 
-async function saveCurrentNote() {
+async function saveCurrentNote(sessionEnd = false) {
   if (!activeNote) return;
   let body = noteBodyContent;
   if (noteEncrypted && notePasswords.has(activeNote)) {
@@ -423,8 +425,9 @@ async function saveCurrentNote() {
   await api(`/api/note/${encodeURIComponent(activeNote)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content: noteFrontmatter + body }),
+    body: JSON.stringify({ content: noteFrontmatter + body, session_end: sessionEnd }),
   });
+  if (sessionEnd) _invalidateHistoryCache(activeNote);
   noteMtime = Date.now() / 1000;
   metaSecondary.textContent = 'Last change: ' + formatDate(noteMtime);
 }
@@ -670,17 +673,18 @@ async function selectTag(tag) {
     return;
   }
 
-  // Normal navigation — always reset the trash sub-filter and locked group.
+  // Normal navigation — always reset the trash sub-filter, locked group, and alpha groups.
   trashTagFilter = '';
   lockedGroupExpanded = false;
   clearTimeout(lockedCollapseTimer);
   lockedCollapseTimer = null;
+  alphaGroupExpanded.clear();
   clearTimeout(saveTimer);
   if (activeNote && noteEncrypted && notePasswords.has(activeNote)) {
     notePasswords.delete(activeNote);
     cancelAutoLockTimer();
   }
-  if (activeNote && colContent.classList.contains('editing')) await saveCurrentNote();
+  if (activeNote && colContent.classList.contains('editing')) await saveCurrentNote(true);
   setActiveButton(null);
   activeTag = tag; activeNote = ''; searchQuery = '';
   document.getElementById('search-input').value = '';
@@ -705,6 +709,12 @@ function _collapseLockedGroup() {
   lockedCollapseTimer = null;
   lockedGroupExpanded = false;
   renderNotes();
+}
+
+// Returns the first Unicode letter of a title, uppercased, skipping emojis/symbols.
+function _firstLetter(title) {
+  const m = (title || '').match(/\p{L}/u);
+  return m ? m[0].toUpperCase() : '#';
 }
 
 // ── Notes (col 2) ──────────────────────────────────────────────────────────
@@ -820,13 +830,92 @@ async function renderNotes() {
         openNote(currentName);
       }
     });
+
     return li;
   }
 
-  // Render unlocked notes
-  unlockedNotes.forEach(({ name, title, encrypted }) => {
-    list.appendChild(makeNoteItem(name, title, encrypted));
-  });
+  // Render unlocked notes (with collapsible alpha group headers in alphabetic sort)
+  if (sortBy === 'alpha' && !searchQuery) {
+    const letterCount = {};
+    unlockedNotes.forEach(({ title }) => {
+      const l = _firstLetter(title);
+      letterCount[l] = (letterCount[l] || 0) + 1;
+    });
+
+    // Auto-expand the group containing the active note
+    if (activeNote) {
+      const activeItem = unlockedNotes.find(n => n.name === activeNote);
+      if (activeItem) {
+        const al = _firstLetter(activeItem.title);
+        if (letterCount[al] >= 6) alphaGroupExpanded.add(al);
+      }
+    }
+
+    // Pass 1: bucket notes into qualifying groups or ungrouped.
+    // groupOrder preserves the order groups first appear in the sorted list.
+    const groupOrder   = [];
+    const groupNotes   = {}; // letter → [notes]
+    const ungrouped    = [];
+
+    unlockedNotes.forEach(note => {
+      const letter = _firstLetter(note.title);
+      if (letterCount[letter] >= 6) {
+        if (!groupNotes[letter]) {
+          groupNotes[letter] = [];
+          groupOrder.push(letter);
+        }
+        groupNotes[letter].push(note);
+      } else {
+        ungrouped.push(note);
+      }
+    });
+
+    // Pass 2: render each group header (+ notes if expanded), then ungrouped notes.
+    let firstHeader = true;
+    groupOrder.forEach(letter => {
+      const expanded = alphaGroupExpanded.has(letter);
+
+      const hdr = document.createElement('li');
+      hdr.className = 'note-group-header alpha-group-header' + (firstHeader ? ' first' : '');
+      firstHeader = false;
+
+      const hText = document.createElement('span');
+      hText.className = 'alpha-group-label';
+      hText.textContent = letter;
+
+      const hCount = document.createElement('span');
+      hCount.className = 'alpha-group-count';
+      hCount.textContent = groupNotes[letter].length;
+
+      const hChevron = document.createElement('span');
+      hChevron.className = 'alpha-group-chevron';
+      hChevron.textContent = expanded ? '▾' : '▸';
+
+      hdr.appendChild(hText);
+      hdr.appendChild(hCount);
+      hdr.appendChild(hChevron);
+
+      hdr.addEventListener('click', () => {
+        if (alphaGroupExpanded.has(letter)) alphaGroupExpanded.delete(letter);
+        else                                alphaGroupExpanded.add(letter);
+        renderNotes();
+      });
+
+      list.appendChild(hdr);
+      if (expanded) {
+        groupNotes[letter].forEach(({ name, title, encrypted }) =>
+          list.appendChild(makeNoteItem(name, title, encrypted)));
+      }
+    });
+
+    // Ungrouped notes appear after all groups
+    ungrouped.forEach(({ name, title, encrypted }) =>
+      list.appendChild(makeNoteItem(name, title, encrypted)));
+  } else {
+    unlockedNotes.forEach(({ name, title, encrypted }) => {
+      list.appendChild(makeNoteItem(name, title, encrypted));
+    });
+  }
 
   // Render locked group
   if (lockedNotes.length) {
@@ -887,7 +976,7 @@ async function openNote(name, startEditing = false) {
     notePasswords.delete(activeNote);
     cancelAutoLockTimer();
   }
-  if (activeNote && colContent.classList.contains('editing')) await saveCurrentNote();
+  if (activeNote && colContent.classList.contains('editing')) await saveCurrentNote(true);
 
   activeNote = name;
   document.querySelectorAll('.note-item').forEach(el =>
@@ -2191,37 +2280,49 @@ document.getElementById('notable-folder-path').addEventListener('input', () => {
 
 // ── NEW NOTE ────────────────────────────────────────────────────────────────
 
+async function _finalizeNewNote(caller) {
+  clearTimeout(saveTimer);
+  if (activeNote) await saveCurrentNote(true);
+  enterViewMode();
+  setActiveButton(null);
+}
+
 document.getElementById('btn-new').addEventListener('click', async () => {
   if (activeTag === TRASH_TAG) return;
 
-  if (activeButton === 'new') {
-    clearTimeout(saveTimer);
-    if (activeNote) await saveCurrentNote();
-    enterViewMode();
-    setActiveButton(null);
+  // Already composing a new note — finalize it, don't spawn another.
+  if (activeButton === 'new' || _isCreatingNote) {
+    await _finalizeNewNote('btn-new-click');
     return;
   }
 
-  clearTimeout(saveTimer);
-  if (activeNote && colContent.classList.contains('editing')) await saveCurrentNote();
-  activeNote = '';
+  _isCreatingNote = true;
+  // Set activeButton synchronously before any await so re-entrant clicks
+  // hit the guard above instead of starting a second creation.
   setActiveButton('new');
+  clearTimeout(saveTimer);
+  if (activeNote && colContent.classList.contains('editing')) await saveCurrentNote(true);
+  activeNote = '';
 
-  const { name } = await api('/api/next-untitled');
-  await api('/api/note', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, content: `# ${name}\n` }),
-  });
+  try {
+    const { name } = await api('/api/next-untitled');
+    await api('/api/note', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, content: `# ${name}\n` }),
+    });
 
-  if (activeTag !== '') {
-    activeTag = '';
-    document.querySelectorAll('.tag-item').forEach(el =>
-      el.classList.toggle('active', el.dataset.tag === ''));
-    updateToolbarState();
+    if (activeTag !== '') {
+      activeTag = '';
+      document.querySelectorAll('.tag-item').forEach(el =>
+        el.classList.toggle('active', el.dataset.tag === ''));
+      updateToolbarState();
+    }
+
+    await renderNotes();
+    await openNote(name, true);
+  } finally {
+    _isCreatingNote = false;
   }
-
-  await renderNotes();
-  await openNote(name, true);
 });
 
 // ── EDIT ────────────────────────────────────────────────────────────────────
@@ -2231,7 +2332,7 @@ document.getElementById('btn-edit').addEventListener('click', async () => {
 
   if (activeButton === 'edit') {
     clearTimeout(saveTimer);
-    await saveCurrentNote();
+    await saveCurrentNote(true);
     enterViewMode();
     setActiveButton(null);
     return;
@@ -2251,7 +2352,7 @@ document.getElementById('btn-tags').addEventListener('click', async () => {
 
   if (!activeNote) return;
   clearTimeout(saveTimer);
-  if (colContent.classList.contains('editing')) await saveCurrentNote();
+  if (colContent.classList.contains('editing')) await saveCurrentNote(true);
   setActiveButton('tags');
   await openTagPopover();
 });
@@ -2383,6 +2484,19 @@ document.addEventListener('mousedown', async e => {
   await closeTagPopover(true);
 });
 
+// Clicking anywhere outside col-content while in new-note or edit mode saves and
+// closes the active editing session.
+// btn-new is in the sidebar (not col-content) and handles its own save→create
+// transition, so exclude it to avoid a double-save.
+document.addEventListener('mousedown', async e => {
+  const isNew  = (activeButton === 'new') && !_isCreatingNote;
+  const isEdit = (activeButton === 'edit');
+  if (!isNew && !isEdit) return;
+  if (colContent.contains(e.target)) return;
+  if (e.target.closest('#btn-new')) return;  // btn-new handles its own transition
+  await _finalizeNewNote('outside-mousedown');
+});
+
 // ── TRASH ───────────────────────────────────────────────────────────────────
 
 // Returns a Promise that resolves true (Yes) or false (No/dismiss).
@@ -2451,7 +2565,7 @@ document.getElementById('btn-trash').addEventListener('click', async () => {
   if (!activeNote) return;
   if (endpoint === 'trash') {
     clearTimeout(saveTimer);
-    if (colContent.classList.contains('editing')) await saveCurrentNote();
+    if (colContent.classList.contains('editing')) await saveCurrentNote(true);
   }
   await api(`/api/note/${encodeURIComponent(activeNote)}/${endpoint}`, { method: 'POST' });
   notePasswords.delete(activeNote);
@@ -2461,6 +2575,117 @@ document.getElementById('btn-trash').addEventListener('click', async () => {
   document.querySelectorAll('.note-item').forEach(el => el.classList.remove('active'));
   await renderTags(activeTag === TRASH_TAG);
   await renderNotes();
+});
+
+// ── Note history tooltip ────────────────────────────────────────────────────
+
+const _historyCache = new Map(); // noteName → history[] (lazy-loaded)
+let   _historyFor   = null;      // name of the note currently shown in the tooltip
+
+const _MONTHS = ['January','February','March','April','May','June',
+                 'July','August','September','October','November','December'];
+
+function _tooltipEl() { return document.getElementById('note-history-tooltip'); }
+
+function _fmtHistoryDate(isoStr) {
+  const d = new Date(isoStr);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()} ${_MONTHS[d.getMonth()]} ${d.getDate()} at ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function _buildTooltipHtml(history) {
+  if (!history.length) return '';
+  const ACT_LABEL = { created: 'Created', added: 'Added', removed: 'Removed', changed: 'Edited' };
+
+  const rows = history.map(entry => {
+    const label   = ACT_LABEL[entry.act] || 'Edited';
+    const hideVia = entry.act === 'created' && entry.via === 'myNote';
+    const via     = hideVia ? '' : ` <span class="ht-via">via ${entry.via}</span>`;
+    return `<div class="ht-row"><span class="ht-label">${label}:</span><span class="ht-date">${_fmtHistoryDate(entry.at)}</span>${via}</div>`;
+  });
+
+  // Append a "Last change" summary row if there was at least one edit after creation
+  const nonCreated = history.filter(e => e.act !== 'created');
+  if (nonCreated.length) {
+    const last = nonCreated[nonCreated.length - 1];
+    const via  = ` <span class="ht-via">via ${last.via}</span>`;
+    rows.push(`<div class="ht-row ht-last"><span class="ht-label">Last change:</span><span class="ht-date">${_fmtHistoryDate(last.at)}</span>${via}</div>`);
+  }
+
+  return rows.join('');
+}
+
+function _positionTooltip(tip, clientX, clientY) {
+  const tw = tip.offsetWidth  || 260;
+  const th = tip.offsetHeight || 80;
+  let x = clientX + 14;
+  let y = clientY - 8;
+  if (x + tw > window.innerWidth  - 8) x = clientX - tw - 14;
+  if (y + th > window.innerHeight - 8) y = window.innerHeight - th - 8;
+  tip.style.left = x + 'px';
+  tip.style.top  = y + 'px';
+}
+
+function _hideHistoryTooltip() {
+  const tip = _tooltipEl();
+  if (tip) tip.classList.add('hidden');
+  _historyFor = null;
+}
+
+// Invalidate cache entry whenever a note is saved so next hover is fresh
+function _invalidateHistoryCache(noteName) {
+  _historyCache.delete(noteName);
+}
+
+// Show history for a given note name, positioned at cursor coords.
+async function _showHistoryFor(noteName, clientX, clientY) {
+  const tip = _tooltipEl();
+  if (!tip || !noteName) return;
+
+  if (noteName === _historyFor) {
+    _positionTooltip(tip, clientX, clientY);
+    return;
+  }
+
+  _historyFor = noteName;
+  tip.classList.add('hidden');
+
+  if (!_historyCache.has(noteName)) {
+    try {
+      const h = await api(`/api/note/${encodeURIComponent(noteName)}/history`);
+      _historyCache.set(noteName, Array.isArray(h) ? h : []);
+    } catch (err) {
+      _historyCache.set(noteName, []);
+    }
+  }
+
+  if (_historyFor !== noteName) return;
+
+  const history = _historyCache.get(noteName);
+  if (!history.length) return;
+
+  tip.innerHTML = _buildTooltipHtml(history);
+  tip.classList.remove('hidden');
+  _positionTooltip(tip, clientX, clientY);
+}
+
+// ── Tooltip on note-title bar (the "Created / Last change" strip) ───────────
+const _noteTitleEl = document.getElementById('note-title');
+
+_noteTitleEl.addEventListener('mouseover', e => {
+  if (!activeNote) return;
+  _showHistoryFor(activeNote, e.clientX, e.clientY);
+});
+
+_noteTitleEl.addEventListener('mousemove', e => {
+  const tip = _tooltipEl();
+  if (!tip || tip.classList.contains('hidden')) return;
+  _positionTooltip(tip, e.clientX, e.clientY);
+});
+
+_noteTitleEl.addEventListener('mouseout', e => {
+  if (e.relatedTarget && e.relatedTarget.closest('#note-title')) return;
+  _hideHistoryTooltip();
 });
 
 // ── Collapse locked group on outside click ──────────────────────────────────
@@ -2493,7 +2718,7 @@ document.addEventListener('keydown', async e => {
   }
   if (activeButton === 'edit' || activeButton === 'new') {
     clearTimeout(saveTimer);
-    if (activeNote) await saveCurrentNote();
+    if (activeNote) await saveCurrentNote(true);
     enterViewMode();
     setActiveButton(null);
     return;
@@ -2634,16 +2859,27 @@ function _isEditingActive() {
 }
 
 function _applyNotesUpdate(ev) {
-  renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(() => {
-    if (!ev || !ev.appended || !ev.name) return;
-    const noteName = ev.name.replace(/\.md$/i, '');
-    const item = Array.from(document.querySelectorAll('.note-item'))
-                      .find(el => el.dataset.name === noteName);
-    if (item) {
-      item.classList.remove('tg-blink');
-      void item.offsetWidth;               // restart animation if already running
-      item.classList.add('tg-blink');
-      setTimeout(() => item.classList.remove('tg-blink'), 9000);
+  const noteName = ev?.name ? ev.name.replace(/\.md$/i, '') : null;
+  if (noteName) _invalidateHistoryCache(noteName);
+  renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(async () => {
+    // If the updated note is currently open in view mode, reload its content.
+    if (noteName && noteName === activeNote && !colContent.classList.contains('editing')) {
+      await openNote(activeNote);
+    }
+    // Blink the note list item to signal the Telegram update.
+    if (ev?.appended && noteName) {
+      const allItems = Array.from(document.querySelectorAll('.note-item'));
+      const item = allItems.find(el => el.dataset.name === noteName);
+      if (item) {
+        item.classList.remove('tg-blink');
+        void item.offsetWidth;             // restart animation if already running
+        item.classList.add('tg-blink');
+        document.addEventListener('click', () => {
+          item.classList.remove('tg-blink');
+        }, { once: true });
+      } else {
+        console.warn(`[blink] item NOT found for noteName=${noteName}`);
+      }
     }
   });
 }
@@ -2972,7 +3208,7 @@ document.querySelectorAll('.sort-btn').forEach(btn => {
       sortDesc = !sortDesc;
     } else {
       sortBy = clicked;
-      // Keep current direction when switching option
+      alphaGroupExpanded.clear();
     }
     renderSortBar();
     await _saveSortPrefs();

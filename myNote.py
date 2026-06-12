@@ -164,6 +164,58 @@ def _set_trashed_at(filepath: str, ts: 'float | None') -> None:
 
 
 # ---------------------------------------------------------------------------
+# Note history (sidecar *.history.json)
+# ---------------------------------------------------------------------------
+
+def _history_path(fp: str) -> str:
+    return os.path.splitext(fp)[0] + '.history.json'
+
+def _read_history(fp: str) -> list:
+    try:
+        with open(_history_path(fp), 'r', encoding='utf-8') as f:
+            return _json.load(f)
+    except (OSError, ValueError):
+        return []
+
+_HISTORY_SESSION_WINDOW = 15 * 60  # seconds — edits within this gap are merged
+
+# Maps realpath(fp) → note content at the time the last history entry was written.
+# Used by api_save_note to detect real changes regardless of auto-save frequency.
+_last_history_content: 'dict[str, str]' = {}
+
+def _append_history(fp: str, act: str, via: str) -> None:
+    from datetime import datetime as _dt
+    now     = _dt.now()
+    history = _read_history(fp)
+
+    if act != 'created' and history:
+        last = history[-1]
+        if last.get('act') == 'created' and last.get('via') == via and not last.get('settled'):
+            try:
+                elapsed = (now - _dt.strptime(last['at'], '%Y-%m-%dT%H:%M:%S')).total_seconds()
+                within  = elapsed <= _HISTORY_SESSION_WINDOW
+            except (ValueError, KeyError):
+                within = False
+            if within:
+                # First edit session right after creation — slide the creation
+                # timestamp forward; don't record a separate "Edited" entry.
+                # Mark settled so this rule fires only once per note.
+                last['at']      = now.strftime('%Y-%m-%dT%H:%M:%S')
+                last['settled'] = True
+                with open(_history_path(fp), 'w', encoding='utf-8') as f:
+                    _json.dump(history, f, ensure_ascii=False)
+                return
+            # else: created long ago — fall through and append a real edit entry
+
+    history.append({'at': now.strftime('%Y-%m-%dT%H:%M:%S'), 'via': via, 'act': act})
+    try:
+        with open(_history_path(fp), 'w', encoding='utf-8') as f:
+            _json.dump(history, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -183,6 +235,40 @@ def _extract_title(filepath: str) -> str:
 
 def _note_files():
     return sorted(glob_module.glob(os.path.join(paths.get_notes_dir(), '*.md')))
+
+
+def _unique_note_path(safe_name: str, notes_dir: str, exclude_fp: str = None):
+    """Return (unique_safe_name, filepath) that doesn't conflict with existing files
+    or reserved command names.  exclude_fp is the current path of a note being renamed."""
+    candidate = safe_name
+    i = 1
+    while True:
+        if candidate.lower() in _RESERVED_NAMES:
+            candidate = f'{safe_name}_{i}'
+            i += 1
+            continue
+        fp      = os.path.join(notes_dir, candidate + '.md')
+        real_fp = os.path.realpath(fp)
+        if not os.path.exists(fp):
+            return candidate, fp
+        if exclude_fp and real_fp == os.path.realpath(exclude_fp):
+            return candidate, fp  # renaming a note to its own name — no conflict
+        candidate = f'{safe_name}_{i}'
+        i += 1
+
+
+def _find_note_by_title(title: str):
+    """Return the most recently modified non-trashed note whose heading matches title, or None."""
+    title_lower = title.strip().lower()
+    matches = []
+    for fp in _note_files():
+        if TRASH_TAG in _read_frontmatter(fp).get('tags', []):
+            continue
+        if _extract_title(fp).strip().lower() == title_lower:
+            matches.append(fp)
+    if not matches:
+        return None
+    return max(matches, key=os.path.getmtime)
 
 
 def _sanitize_filename(name: str) -> str:
@@ -364,26 +450,51 @@ def api_create_note():
     content = data.get('content', '')
     if not name or re.search(r'[/\\<>:"|?*]', name) or name.startswith('.'):
         abort(400)
+    if name.lower() in _RESERVED_NAMES:
+        abort(400)
     fp = os.path.join(paths.get_notes_dir(), name + '.md')
     if os.path.exists(fp):
         abort(409)
     with open(fp, 'w', encoding='utf-8') as f:
         f.write(content)
     _inject_note_id(fp)
+    _append_history(fp, 'created', 'myNote')
+    _last_history_content[os.path.realpath(fp)] = content
     return jsonify({'name': name}), 201
 
 
 @app.route('/api/note/<path:name>', methods=['PATCH'])
 def api_save_note(name):
-    fp = _safe_path(name)
+    fp      = _safe_path(name)
+    real_fp = os.path.realpath(fp)
     if not os.path.isfile(fp):
         abort(404)
-    data    = request.get_json(force=True)
-    content = data.get('content', '')
+    data        = request.get_json(force=True)
+    content     = data.get('content', '')
+    session_end = bool(data.get('session_end', False))
     with open(fp, 'w', encoding='utf-8') as f:
         f.write(content)
     _inject_note_id(fp)
+    if session_end:
+        # Compare against content at last history write, not last auto-save, so
+        # frequent auto-saves don't mask real changes at session-end time.
+        last_hist = _last_history_content.get(real_fp)
+        changed   = (last_hist is None) or (content != last_hist)
+        if changed:
+            print(f'[hist] PATCH {name!r} act=changed session_end=True → history_written=True')
+            _append_history(fp, 'changed', 'myNote')
+            _last_history_content[real_fp] = content
+        else:
+            print(f'[hist] PATCH {name!r} session_end=True changed=False → history_written=False')
     return jsonify({'ok': True})
+
+
+@app.route('/api/note/<path:name>/history')
+def api_note_history(name):
+    fp = _safe_path(name)
+    if not os.path.isfile(fp):
+        abort(404)
+    return jsonify(_read_history(fp))
 
 
 @app.route('/api/note/<path:name>/tags', methods=['GET'])
@@ -1180,13 +1291,20 @@ def api_rename_note(name):
     if not new_name:
         abort(400)
     notes_dir = paths.get_notes_dir()
-    new_fp    = os.path.realpath(os.path.join(notes_dir, new_name + '.md'))
     base      = os.path.realpath(notes_dir)
+    # Auto-increment name if the target filename already exists (and isn't the same file)
+    new_name, new_fp = _unique_note_path(new_name, notes_dir, exclude_fp=fp)
     if not new_fp.startswith(base + os.sep):
         abort(403)
-    if os.path.exists(new_fp):
-        abort(409)
-    os.rename(fp, new_fp)
+    if os.path.realpath(new_fp) != os.path.realpath(fp):
+        old_real = os.path.realpath(fp)
+        os.rename(fp, new_fp)
+        old_hp = _history_path(fp)
+        if os.path.exists(old_hp):
+            os.rename(old_hp, _history_path(new_fp))
+        # Keep _last_history_content key in sync with the new path.
+        if old_real in _last_history_content:
+            _last_history_content[os.path.realpath(new_fp)] = _last_history_content.pop(old_real)
     return jsonify({'name': new_name})
 
 
@@ -1256,34 +1374,38 @@ def _tg_ts_file() -> str:
     from datetime import datetime
     return datetime.now().strftime('%Y%m%d_%H%M%S')
 
-_TG_DIVIDER = '\n\n' + '-' * 99 + '\n\n'
+_TG_DIVIDER = '\n\n---\n\n'
 
 def _tg_create_note(title: str, body: str) -> None:
-    """Create a new note or append to an existing one if the title matches."""
-    safe      = _sanitize_filename(title) or f'tg_{_tg_ts_file()}'
+    """Append to the most recent non-trashed note whose heading matches title,
+    or create a new note with a unique name if none is found."""
     notes_dir = paths.get_notes_dir()
-    fp        = os.path.join(notes_dir, safe + '.md')
 
-    note_name = safe + '.md'
+    # Search all non-trashed notes by heading (handles renames and name collisions)
+    existing_fp = _find_note_by_title(title)
 
-    if os.path.exists(fp):
-        # Title matches an existing note — append content below a divider.
-        # The repeated header itself is not written, only the body.
+    if existing_fp:
+        note_name = os.path.basename(existing_fp)
         if body.strip():
-            with open(fp, 'r', encoding='utf-8') as f:
+            with open(existing_fp, 'r', encoding='utf-8') as f:
                 existing = f.read()
-            with open(fp, 'w', encoding='utf-8') as f:
+            with open(existing_fp, 'w', encoding='utf-8') as f:
                 f.write(existing.rstrip() + _TG_DIVIDER + body.strip())
+            _append_history(existing_fp, 'added', 'Telegram')
             _tg_log.info('  appended to existing note: %r', note_name)
             _sse_broadcast(_json.dumps({'type': 'notes-updated', 'name': note_name, 'appended': True}))
         else:
             _tg_log.debug('  skipped append — no body content')
     else:
-        # New note: write frontmatter + heading + body
+        # No matching active note — create a new one with a unique filename
+        safe             = _sanitize_filename(title) or f'tg_{_tg_ts_file()}'
+        _, new_fp        = _unique_note_path(safe, notes_dir)
+        note_name        = os.path.basename(new_fp)
         fm      = '---\nid: ' + str(_uuid_mod.uuid4()) + '\ntags: [Telegram]\n---\n'
         content = fm + f'# {title}\n' + (('\n' + body.strip()) if body.strip() else '')
-        with open(fp, 'w', encoding='utf-8') as f:
+        with open(new_fp, 'w', encoding='utf-8') as f:
             f.write(content)
+        _append_history(new_fp, 'created', 'Telegram')
         _tg_log.info('  new note created: %r', note_name)
         _sse_broadcast(_json.dumps({'type': 'notes-updated', 'name': note_name, 'appended': False}))
 
@@ -1340,7 +1462,9 @@ def _tg_run(coro):
 
 # ── Telegram command helpers ───────────────────────────────────────────────────
 
-_TG_CMD_GET   = re.compile(r'^get\s+(.+)$', re.IGNORECASE)
+_TG_CMD_GET      = re.compile(r'^get\s+(.+)$',  re.IGNORECASE)
+_TG_CMD_LIST     = re.compile(r'^list$',        re.IGNORECASE)
+_RESERVED_NAMES  = frozenset({'list', 'get'})   # note names that clash with Telegram commands
 _TG_MAX_SEND  = 4000    # stay safely under Telegram's 4096-char hard limit
 # Invisible marker (U+200C ZERO WIDTH NON-JOINER) prepended to every reply we send.
 # Lets us skip our own bot replies on re-poll without blocking the user's own commands.
@@ -1359,31 +1483,37 @@ def _tg_extract_claim_email(text: str) -> 'str | None':
 
 
 def _tg_find_note(search: str) -> 'tuple[str, str] | None':
-    """Find a note by exact then partial name/title match.
+    """Find the single best-matching non-trashed note by name/title.
 
-    Returns (filepath, note_name) or None.
+    Matching priority:
+      1. Exact match (name or title equals query) — returned immediately.
+      2. Best partial match by coverage score (len(query) / len(field)).
+         When multiple notes partially match, the highest-scoring one wins.
+    Returns (filepath, display_title) or None.
     """
     q = search.lower().strip()
     if not q:
         return None
-    partial: 'tuple[str, str] | None' = None
-    partial_score = -1.0
+    best: 'tuple[str, str] | None' = None
+    best_score = -1.0
     for fp in _note_files():
+        if TRASH_TAG in _read_frontmatter(fp).get('tags', []):
+            continue
         name  = os.path.splitext(os.path.basename(fp))[0]
         title = (_extract_title(fp) or '').strip()
         nl    = name.lower()
         tl    = title.lower()
         if nl == q or tl == q:
-            return (fp, name)   # exact — stop immediately
+            return (fp, title or name)   # exact — best possible, stop immediately
         if q in nl or q in tl:
             score = max(
                 len(q) / len(nl) if nl else 0.0,
                 len(q) / len(tl) if tl else 0.0,
             )
-            if score > partial_score:
-                partial_score = score
-                partial = (fp, name)
-    return partial
+            if score > best_score:
+                best_score = score
+                best = (fp, title or name)
+    return best
 
 
 def _tg_note_body(fp: str) -> str:
@@ -1563,58 +1693,92 @@ async def _tg_process_message(client, msg) -> None:
     _tg_log.debug('  msg id=%-8s  photo=%-5s  doc=%-5s  text=%.50r',
                   msg.id, bool(msg.photo), bool(msg.document), text)
 
+    # ── Command: list ─────────────────────────────────────────────────────────
+    if text and _TG_CMD_LIST.match(text) and not msg.photo and not msg.document:
+        _tg_log.info('Command "list" received')
+        titles = []
+        for fp in _note_files():
+            fm_l = _read_frontmatter(fp)
+            if TRASH_TAG in fm_l.get('tags', []):
+                continue
+            if fm_l.get('encrypted'):
+                continue
+            titles.append(_extract_title(fp) or os.path.splitext(os.path.basename(fp))[0])
+        titles.sort(key=str.lower)
+        if titles:
+            body = '\n'.join(f'• {t}' for t in titles)
+            header = _TG_REPLY_MARK + f'📋 Notes ({len(titles)}):\n\n'
+            if len(header) + len(body) > _TG_MAX_SEND:
+                body = body[:_TG_MAX_SEND - len(header) - 15] + '\n\n…[truncated]'
+            sent = await client.send_message(msg.peer_id, header + body)
+        else:
+            sent = await client.send_message(msg.peer_id, _TG_REPLY_MARK + '📋 No notes found.')
+        # Advance watermark so our reply isn't re-ingested as a note on the next poll.
+        if sent:
+            _c = paths._load_config()
+            _t = _c.setdefault('telegram', {})
+            _t['last_message_id'] = max(int(_t.get('last_message_id', 0)), sent.id)
+            paths._save_config(_c)
+            _tg_log.debug('  watermark advanced to %d', sent.id)
+        return False  # command handled — no note created, no claim needed
+
     # ── Command: get <notename> ────────────────────────────────────────────────
     cmd_m = _TG_CMD_GET.match(text) if text else None
     if cmd_m and not msg.photo and not msg.document:
         search = cmd_m.group(1).strip()
         _tg_log.info('Command "get" received — searching for %r', search)
-        result = _tg_find_note(search)
-        if result is None:
-            await client.send_message(msg.peer_id,
-                                      _TG_REPLY_MARK + f'❌ Note not found: {search}')
+        match = _tg_find_note(search)
+
+        sent_ids: 'list[int]' = []
+
+        if match is None:
+            sent = await client.send_message(msg.peer_id,
+                                             _TG_REPLY_MARK + f'❌ Note not found: {search}')
+            if sent: sent_ids.append(sent.id)
+
         else:
-            fp_r, note_name = result
+            fp_r, note_name = match
             fm_r = _read_frontmatter(fp_r)
             if fm_r.get('encrypted'):
-                await client.send_message(
+                sent = await client.send_message(
                     msg.peer_id,
                     _TG_REPLY_MARK + f'\U0001f512 "{note_name}" is encrypted and cannot be sent.',
                 )
+                if sent: sent_ids.append(sent.id)
             else:
                 raw_body = _tg_note_body(fp_r)
                 # Strip leading H1 — it duplicates the title we show in the header
                 raw_body = re.sub(r'^[ \t]*#[^#\n][^\n]*\n?', '',
                                   raw_body.lstrip('\n'), count=1).lstrip('\n')
                 plain, media_files = _md_to_telegram(raw_body)
+                if not plain and not media_files:
+                    plain = '(empty note)'
                 underline = '─' * min(40, max(len(note_name), 4))
                 header = _TG_REPLY_MARK + f'\U0001f4d2 {note_name}\n{underline}\n\n'
                 if len(header) + len(plain) > _TG_MAX_SEND:
                     plain = plain[:_TG_MAX_SEND - len(header) - 15] + '\n\n…[truncated]'
-                max_sent_id = 0
                 try:
                     sent = await client.send_message(msg.peer_id, header + plain)
-                    max_sent_id = max(max_sent_id, sent.id)
+                    if sent: sent_ids.append(sent.id)
                     _tg_log.info('  text sent for "get %s"', search)
                 except Exception as _e:
                     _tg_log.error('  failed to send text: %s', _e)
                 for mf in media_files:
                     try:
                         sent_f = await client.send_file(msg.peer_id, mf)
-                        if sent_f:
-                            max_sent_id = max(max_sent_id, sent_f.id)
+                        if sent_f: sent_ids.append(sent_f.id)
                         _tg_log.debug('  sent file: %s', os.path.basename(mf))
                     except Exception as _ef:
                         _tg_log.error('  failed to send file %s: %s',
                                       os.path.basename(mf), _ef)
-                # Advance the poll watermark past our own replies so they are
-                # never re-ingested as notes on the next poll cycle.
-                if max_sent_id > 0:
-                    _c = paths._load_config()
-                    _t = _c.setdefault('telegram', {})
-                    _t['last_message_id'] = max(
-                        int(_t.get('last_message_id', 0)), max_sent_id)
-                    paths._save_config(_c)
-                    _tg_log.debug('  watermark advanced to %d', max_sent_id)
+
+        # Advance the poll watermark past our own replies.
+        if sent_ids:
+            _c = paths._load_config()
+            _t = _c.setdefault('telegram', {})
+            _t['last_message_id'] = max(int(_t.get('last_message_id', 0)), max(sent_ids))
+            paths._save_config(_c)
+            _tg_log.debug('  watermark advanced to %d', max(sent_ids))
         return False  # do not create a note from the command message
 
     # Skip entirely empty messages (no text, no media — nothing to save)
