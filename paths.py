@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import threading
 
 
 def _is_frozen() -> bool:
@@ -43,20 +44,38 @@ PORT: int = 5000
 # Config helpers
 # ---------------------------------------------------------------------------
 
+# Serialises every load-modify-save cycle so concurrent threads (iCloud sync,
+# GDrive sync, TG, Flask routes) can't truncate or overwrite each other.
+_config_lock = threading.RLock()
+
+
 def _load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    with _config_lock:
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
 
 
 def _save_config(cfg: dict) -> None:
+    """Atomically write cfg via a temp file so readers never see a truncated
+    file mid-write (which caused near-empty config corruption at night)."""
     os.makedirs(APPDATA_DIR, exist_ok=True)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2)
+    tmp = CONFIG_FILE + '.tmp'
+    with _config_lock:
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=2)
+            os.replace(tmp, CONFIG_FILE)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
 
 # ---------------------------------------------------------------------------

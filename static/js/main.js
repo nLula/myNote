@@ -160,6 +160,7 @@ let noteEncrypted    = false;
 const notePasswords  = new Map(); // noteName → session decryption password
 let autoLockTimer    = null;
 let toastFilePath    = null;
+let _editingHbTimer  = null;  // heartbeat interval while editing is active
 
 // ── Toolbar meta display ───────────────────────────────────────────────────
 
@@ -235,7 +236,28 @@ function enterViewMode() {
   }
   colContent.classList.remove('editing');
   document.body.classList.remove('editing-active');
+  _stopEditingHeartbeat();
   _flushPendingUpdate();
+}
+
+function _notifyEditing(active) {
+  fetch('/api/editing', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({active})
+  }).catch(() => {});
+}
+
+function _startEditingHeartbeat() {
+  _notifyEditing(true);
+  if (_editingHbTimer) return;
+  // Refresh the 30-second server window every 20 s while editing is active.
+  _editingHbTimer = setInterval(() => _notifyEditing(true), 20000);
+}
+
+function _stopEditingHeartbeat() {
+  if (_editingHbTimer) { clearInterval(_editingHbTimer); _editingHbTimer = null; }
+  _notifyEditing(false);
 }
 
 function enterEditMode() {
@@ -243,6 +265,7 @@ function enterEditMode() {
   noteEdit.value = noteBodyContent;
   colContent.classList.add('editing');
   document.body.classList.add('editing-active');
+  _startEditingHeartbeat();
   noteEdit.focus();
 }
 
@@ -258,6 +281,7 @@ function clearContentPane() {
   noteEdit.value  = '';
   colContent.classList.remove('editing');
   document.body.classList.remove('editing-active');
+  _stopEditingHeartbeat();
   setMetaDates(null, null);
   document.getElementById('btn-lock').disabled  = true;
   document.getElementById('btn-trash').disabled = true;
@@ -316,6 +340,7 @@ function enterMultiSelectMode() {
   noteEdit.value  = '';
   colContent.classList.remove('editing');
   document.body.classList.remove('editing-active');
+  _stopEditingHeartbeat();
   cancelAutoLockTimer();
 
   // Update title strip
@@ -1838,6 +1863,13 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
     const msg = `Auto-sync — ↑${r.toRemote} to iCloud, ↓${r.toLocal} to PC`;
     icStatus('icloud-status-conn', msg, 'ok');
     setTimeout(() => icStatus('icloud-status-conn', ''), 4000);
+    // Refresh sidebar to pick up notes added, modified, or removed by sync
+    if (!_isEditingActive()) {
+      renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(async () => {
+        // If sync downloaded anything, reload the open note in case it was updated
+        if ((r.toLocal || 0) > 0 && activeNote) await openNote(activeNote);
+      });
+    }
   });
 })();
 
@@ -2038,6 +2070,11 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
     const msg = `Auto-sync — ↑${r.toRemote} to Drive, ↓${r.toLocal} to PC`;
     gdStatus('android-status-conn', msg, 'ok');
     setTimeout(() => gdStatus('android-status-conn', ''), 4000);
+    if (!_isEditingActive()) {
+      renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(async () => {
+        if ((r.toLocal || 0) > 0 && activeNote) await openNote(activeNote);
+      });
+    }
   });
 })();
 
@@ -2282,7 +2319,11 @@ document.getElementById('notable-folder-path').addEventListener('input', () => {
 
 async function _finalizeNewNote(caller) {
   clearTimeout(saveTimer);
-  if (activeNote) await saveCurrentNote(true);
+  try {
+    if (activeNote) await saveCurrentNote(true);
+  } catch (err) {
+    console.error('[finalize] save failed, exiting edit mode anyway:', err);
+  }
   enterViewMode();
   setActiveButton(null);
 }
@@ -2332,7 +2373,7 @@ document.getElementById('btn-edit').addEventListener('click', async () => {
 
   if (activeButton === 'edit') {
     clearTimeout(saveTimer);
-    await saveCurrentNote(true);
+    try { await saveCurrentNote(true); } catch (err) { console.error('[edit-btn] save failed:', err); }
     enterViewMode();
     setActiveButton(null);
     return;
@@ -2718,7 +2759,7 @@ document.addEventListener('keydown', async e => {
   }
   if (activeButton === 'edit' || activeButton === 'new') {
     clearTimeout(saveTimer);
-    if (activeNote) await saveCurrentNote(true);
+    try { if (activeNote) await saveCurrentNote(true); } catch (err) { console.error('[escape] save failed:', err); }
     enterViewMode();
     setActiveButton(null);
     return;
@@ -3174,6 +3215,45 @@ window.addEventListener('pywebviewready', function () {
     window.pywebview.api.toggle_maximize();
   });
 
+  // ── Title-bar drag ────────────────────────────────────────────────────────
+  // WM_NCLBUTTONDOWN cannot be used: WebView2 captures the mouse in its own
+  // process, so the outer window's move loop never receives WM_MOUSEMOVE.
+  // Instead, track screen coords in JS and call SetWindowPos each RAF tick.
+  let _drag = null;
+  let _dragRaf = null;
+
+  document.getElementById('titlebar-drag').addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const sx = e.screenX, sy = e.screenY;
+    window.pywebview.api.get_window_rect().then(function (rect) {
+      if (!rect) return;
+      _drag = { ox: sx, oy: sy, wx: rect.x, wy: rect.y, cx: sx, cy: sy };
+    });
+  });
+
+  document.addEventListener('mousemove', function (e) {
+    if (!_drag) return;
+    _drag.cx = e.screenX;
+    _drag.cy = e.screenY;
+    if (_dragRaf) return;
+    _dragRaf = requestAnimationFrame(function () {
+      _dragRaf = null;
+      if (!_drag) return;
+      window.pywebview.api.move_window(
+        _drag.wx + (_drag.cx - _drag.ox),
+        _drag.wy + (_drag.cy - _drag.oy)
+      );
+    });
+  });
+
+  document.addEventListener('mouseup', function (e) {
+    if (e.button === 0) {
+      _drag = null;
+      if (_dragRaf) { cancelAnimationFrame(_dragRaf); _dragRaf = null; }
+    }
+  });
+
   // Double-click drag area → toggle maximize (standard Windows behaviour)
   document.getElementById('titlebar-drag').addEventListener('dblclick', function () {
     window.pywebview.api.toggle_maximize();
@@ -3187,8 +3267,33 @@ function renderSortBar() {
   document.querySelectorAll('.sort-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.sort === sortBy);
   });
-  document.getElementById('sort-direction').textContent = sortDesc ? '↓' : '↑';
+  const dirEl = document.getElementById('sort-direction');
+  dirEl.textContent = sortDesc ? '▾' : '▴';
+  const tips = {
+    ctime: { asc: 'OLD\nNEW', desc: 'NEW\nOLD' },
+    mtime: { asc: 'OLD\nNEW', desc: 'NEW\nOLD' },
+    alpha: { asc: 'A\nZ',     desc: 'Z\nA'     },
+  };
+  const t = tips[sortBy] || tips.ctime;
+  dirEl.dataset.tooltip = sortDesc ? t.desc : t.asc;
 }
+
+const _sortDirTooltip = document.getElementById('sort-dir-tooltip');
+const _sortDirEl      = document.getElementById('sort-direction');
+
+_sortDirEl.addEventListener('mouseenter', () => {
+  const text = _sortDirEl.dataset.tooltip;
+  if (!text) return;
+  _sortDirTooltip.textContent = text;
+  _sortDirTooltip.style.display = 'block';
+  const r = _sortDirEl.getBoundingClientRect();
+  _sortDirTooltip.style.top  = Math.round(r.top + r.height / 2 - _sortDirTooltip.offsetHeight / 2) + 'px';
+  _sortDirTooltip.style.left = Math.round(r.right + 6) + 'px';
+});
+
+_sortDirEl.addEventListener('mouseleave', () => {
+  _sortDirTooltip.style.display = 'none';
+});
 
 async function _saveSortPrefs() {
   try {

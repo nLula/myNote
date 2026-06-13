@@ -1,4 +1,5 @@
 from flask import Flask, render_template, jsonify, request, abort, send_from_directory
+from datetime import datetime as _dtt
 import os
 import re
 import glob as glob_module
@@ -184,15 +185,14 @@ _HISTORY_SESSION_WINDOW = 15 * 60  # seconds — edits within this gap are merge
 _last_history_content: 'dict[str, str]' = {}
 
 def _append_history(fp: str, act: str, via: str) -> None:
-    from datetime import datetime as _dt
-    now     = _dt.now()
+    now     = _dtt.now()
     history = _read_history(fp)
 
     if act != 'created' and history:
         last = history[-1]
         if last.get('act') == 'created' and last.get('via') == via and not last.get('settled'):
             try:
-                elapsed = (now - _dt.strptime(last['at'], '%Y-%m-%dT%H:%M:%S')).total_seconds()
+                elapsed = (now - _dtt.strptime(last['at'], '%Y-%m-%dT%H:%M:%S')).total_seconds()
                 within  = elapsed <= _HISTORY_SESSION_WINDOW
             except (ValueError, KeyError):
                 within = False
@@ -380,11 +380,21 @@ def api_notes():
             if tag and tag not in fm_tags:
                 continue
         name = os.path.splitext(os.path.basename(fp))[0]
+        # Prefer history "created" timestamp over st_ctime, which resets on copy
+        fs_ctime = os.path.getctime(fp)
+        true_ctime = fs_ctime
+        for entry in _read_history(fp):
+            if entry.get('act') == 'created':
+                try:
+                    true_ctime = _dtt.strptime(entry['at'], '%Y-%m-%dT%H:%M:%S').timestamp()
+                except (ValueError, KeyError):
+                    pass
+                break
         entries.append({
             'name':      name,
             'title':     _extract_title(fp),
             'encrypted': fm.get('encrypted', False),
-            '_ctime':    os.path.getctime(fp),
+            '_ctime':    true_ctime,
             '_mtime':    os.path.getmtime(fp),
         })
     sort_by  = request.args.get('sort',  'ctime')   # ctime | alpha | mtime
@@ -435,10 +445,23 @@ def api_note(name):
     stat = os.stat(fp)
     with open(fp, 'r', encoding='utf-8') as f:
         content = f.read()
+
+    # st_ctime is the filesystem creation time — it resets whenever the file is
+    # copied (e.g. pulled from iCloud on a new machine).  Use the timestamp from
+    # the first "created" history entry instead, which travels with the sidecar.
+    ctime = stat.st_ctime
+    for entry in _read_history(fp):
+        if entry.get('act') == 'created':
+            try:
+                ctime = _dtt.strptime(entry['at'], '%Y-%m-%dT%H:%M:%S').timestamp()
+            except (ValueError, KeyError):
+                pass
+            break
+
     return jsonify({
         'name':    name,
         'content': content,
-        'ctime':   stat.st_ctime,
+        'ctime':   ctime,
         'mtime':   stat.st_mtime,
     })
 
@@ -2316,31 +2339,56 @@ def _sync_notes_by_id(local_dir: str, remote_dir: str) -> dict:
         r = r_by_id.get(note_id)
 
         if l and not r:
-            shutil.copy2(l['path'], os.path.join(remote_dir, l['filename']))
+            _atomic_copy(l['path'], os.path.join(remote_dir, l['filename']))
             to_remote += 1
         elif r and not l:
             if r['filename'] not in _deleted_names:
                 shutil.copy2(r['path'], os.path.join(local_dir, r['filename']))
                 to_local += 1
+            else:
+                # Was deleted locally — ensure the remote copy is also gone
+                try:
+                    os.remove(r['path'])
+                except OSError:
+                    pass
+                hist_rp = _history_path(r['path'])
+                if os.path.isfile(hist_rp):
+                    try:
+                        os.remove(hist_rp)
+                    except OSError:
+                        pass
         else:
             lm, rm = l['mtime'], r['mtime']
             if lm > rm + 1:                          # local is newer → push
-                if l['filename'] != r['filename']:
-                    try: os.remove(r['path'])
-                    except OSError: pass
-                shutil.copy2(l['path'], os.path.join(remote_dir, l['filename']))
-                to_remote += 1
-            elif rm > lm + 1:                        # remote is newer → pull
-                if r['filename'] != l['filename']:
-                    try: os.remove(l['path'])
-                    except OSError: pass
-                shutil.copy2(r['path'], os.path.join(local_dir, r['filename']))
-                to_local += 1
+                # Same guard as the pull direction: if iCloud async-updated the
+                # remote mtime (making local look newer) but content is identical,
+                # skip — otherwise we'd clobber a change another PC just pushed
+                # that iCloud hasn't delivered to this machine yet.
+                if l['filename'] == r['filename'] and not _files_differ(l['path'], r['path']):
+                    skipped += 1
+                else:
+                    if l['filename'] != r['filename']:
+                        try: os.remove(r['path'])
+                        except OSError: pass
+                    _atomic_copy(l['path'], os.path.join(remote_dir, l['filename']))
+                    to_remote += 1
+            elif rm > lm + 1:                        # remote mtime is newer
+                # Guard: iCloud/GDrive updates file mtimes asynchronously when
+                # uploading. Don't pull if content is identical — that's just
+                # mtime drift, not a real remote edit.
+                if _files_differ(l['path'], r['path']):
+                    if r['filename'] != l['filename']:
+                        try: os.remove(l['path'])
+                        except OSError: pass
+                    shutil.copy2(r['path'], os.path.join(local_dir, r['filename']))
+                    to_local += 1
+                else:
+                    skipped += 1
             else:                                    # same age (within 1 s)
                 if l['filename'] != r['filename']:   # filename drift — local wins
                     try: os.remove(r['path'])
                     except OSError: pass
-                    shutil.copy2(l['path'], os.path.join(remote_dir, l['filename']))
+                    _atomic_copy(l['path'], os.path.join(remote_dir, l['filename']))
                     to_remote += 1
                 else:
                     skipped += 1
@@ -2352,18 +2400,36 @@ def _sync_notes_by_id(local_dir: str, remote_dir: str) -> dict:
         l = l_no.get(fname)
         r = r_no.get(fname)
         if l and not r:
-            shutil.copy2(l['path'], os.path.join(remote_dir, fname))
+            _atomic_copy(l['path'], os.path.join(remote_dir, fname))
             to_remote += 1
         elif r and not l:
             if fname not in _deleted_names:
                 shutil.copy2(r['path'], os.path.join(local_dir, fname))
                 to_local += 1
+            else:
+                # Was deleted locally — ensure the remote copy is also gone
+                try:
+                    os.remove(r['path'])
+                except OSError:
+                    pass
+                hist_rp = _history_path(r['path'])
+                if os.path.isfile(hist_rp):
+                    try:
+                        os.remove(hist_rp)
+                    except OSError:
+                        pass
         else:
             lm, rm = l['mtime'], r['mtime']
             if lm > rm + 1:
-                shutil.copy2(l['path'], r['path']); to_remote += 1
+                if not _files_differ(l['path'], r['path']):
+                    skipped += 1
+                else:
+                    _atomic_copy(l['path'], r['path']); to_remote += 1
             elif rm > lm + 1:
-                shutil.copy2(r['path'], l['path']); to_local += 1
+                if _files_differ(l['path'], r['path']):
+                    shutil.copy2(r['path'], l['path']); to_local += 1
+                else:
+                    skipped += 1
             else:
                 skipped += 1
 
@@ -2397,12 +2463,53 @@ def _load_deletion_log(log_path: str) -> dict:
         return {'settings': {}, 'deletions': []}
 
 
-def _save_deletion_log(log_path: str, data: dict) -> None:
+def _atomic_copy(src: str, dst: str) -> None:
+    """Copy src to dst via a temp file + os.replace.
+
+    iCloud/GDrive for Windows holds exclusive locks on files while uploading,
+    which blocks a direct open()-for-write. Writing to a new temp file then
+    renaming into place works because the rename bypasses the open-file lock.
+    """
+    tmp = dst + '.mntmp'
     try:
-        with open(log_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
     except OSError:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _files_differ(p1: str, p2: str) -> bool:
+    """Return True when the two files have different content.
+
+    Checks size first (cheap), then reads both files only when sizes match.
+    Used to distinguish genuine remote updates from iCloud/GDrive async mtime
+    updates that make a remote copy appear newer without changing its content.
+    """
+    try:
+        if os.path.getsize(p1) != os.path.getsize(p2):
+            return True
+        with open(p1, 'rb') as f1, open(p2, 'rb') as f2:
+            return f1.read() != f2.read()
+    except OSError:
+        return True  # can't compare → assume they differ, let caller decide
+
+
+def _save_deletion_log(log_path: str, data: dict) -> None:
+    # Write via temp + atomic replace so iCloud/GDrive file locks don't block us.
+    tmp = log_path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, log_path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _log_deletions(new_entries: list) -> None:
@@ -2474,21 +2581,46 @@ def _delete_note_permanently(filepath: str) -> None:
             os.remove(filepath)
         except OSError:
             pass
+    hist_fp = _history_path(filepath)
+    if os.path.isfile(hist_fp):
+        try:
+            os.remove(hist_fp)
+        except OSError:
+            pass
     entries.append({'path': fname, 'type': 'note', 'deleted_at': now})
     _log_deletions(entries)
 
 
 def _apply_deletion_log(notes_dir: str, attach_dir: str,
-                        log_path: 'str | None' = None) -> None:
-    """Delete any files listed in the deletion log from the given directory pair."""
+                        log_path: 'str | None' = None) -> 'set[str]':
+    """Delete any files listed in the deletion log from the given directory pair.
+
+    Returns the set of entry paths that were *skipped* because the file's mtime
+    is newer than deleted_at — meaning it was recreated on another device after
+    the deletion (resurrection).  The caller should remove these from the log.
+    """
     log_data = _load_deletion_log(log_path or _deletion_log_path(notes_dir))
+    resurrected: set = set()
     for e in log_data['deletions']:
         fp = os.path.join(notes_dir if e['type'] == 'note' else attach_dir, e['path'])
+        deleted_at = e.get('deleted_at', 0)
         if os.path.isfile(fp):
+            if os.path.getmtime(fp) > deleted_at:
+                # File was modified/created after the deletion — resurrection wins
+                resurrected.add(e['path'])
+                continue
             try:
                 os.remove(fp)
             except OSError:
                 pass
+        if e['type'] == 'note':
+            hist_fp = _history_path(fp)
+            if os.path.isfile(hist_fp):
+                try:
+                    os.remove(hist_fp)
+                except OSError:
+                    pass
+    return resurrected
 
 
 def _sync_deletion_log(local_notes: str, remote_notes: str,
@@ -2536,11 +2668,28 @@ def _sync_deletion_log(local_notes: str, remote_notes: str,
     except OSError:
         pass
 
-    _apply_deletion_log(local_notes,  local_attach,  local_log)
+    resurrected_l = _apply_deletion_log(local_notes,  local_attach,  local_log)
+    resurrected_r: set = set()
     try:
-        _apply_deletion_log(remote_notes, remote_attach, remote_log)
+        resurrected_r = _apply_deletion_log(remote_notes, remote_attach, remote_log)
     except OSError:
         pass
+
+    # If a file exists on either side with mtime > deleted_at, it was recreated
+    # on another device after the local deletion.  Remove those entries from the
+    # log so that the next _sync_notes_by_id pass pulls them in normally.
+    all_resurrected = resurrected_l | resurrected_r
+    if all_resurrected:
+        cleaned = {
+            'settings': merged_settings,
+            'deletions': [e for e in merged['deletions']
+                          if e['path'] not in all_resurrected],
+        }
+        _save_deletion_log(local_log, cleaned)
+        try:
+            _save_deletion_log(remote_log, cleaned)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2598,6 +2747,27 @@ if not _icloud_log.handlers:
 
 _icloud_wake      = threading.Event()
 _icloud_sync_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Remote-folder delivery guard
+# ---------------------------------------------------------------------------
+# When a cloud folder doesn't exist yet at first sync it means the cloud
+# client (iCloud / GDrive) is still downloading it from another device.
+# If we create an empty folder immediately the cloud client renames ours to
+# myNotes(1) and delivers the real folder as myNotes — everything breaks.
+#
+# Fix: track when we first noticed the folder was absent.  Refuse to create
+# it for _CLOUD_FOLDER_WAIT seconds.  If the cloud delivers it in that time
+# we use it; if the folder is still absent afterwards it really is a fresh
+# install and os.makedirs in the sync is the right thing to do.
+_CLOUD_FOLDER_WAIT: float = 180.0          # seconds to wait before creating
+_folder_wait_since: dict  = {}             # 'icloud' | 'gdrive' → float ts
+
+# Timestamp until which sync is paused because the user is actively editing.
+# Set via POST /api/editing. Auto-expires after 30 s of inactivity so a crash
+# or missed "editing done" call never blocks sync permanently.
+_editing_until: float = 0.0
+_EDITING_GRACE = 30.0   # seconds to hold the pause after each heartbeat
 
 
 def _detect_icloud_drive() -> 'str | None':
@@ -2717,8 +2887,15 @@ def _migrate_remote_notes_subdir(remote_root: str, log) -> None:
 
 def _icloud_sync_dirs(local_dir: str, remote_dir: str,
                       *, recursive: bool = False,
-                      exts: 'set | None' = None) -> dict:
-    """Sync two directories with 'newest wins' logic. Returns stats dict."""
+                      exts: 'set | None' = None,
+                      name_filter: 'object' = None,
+                      skip_remote_names: 'set | None' = None) -> dict:
+    """Sync two directories with 'newest wins' logic. Returns stats dict.
+
+    name_filter: optional callable(filename) → bool, takes priority over exts.
+    skip_remote_names: filenames that must NOT be pulled from remote; if the
+        remote copy exists it is deleted (stale orphan cleanup).
+    """
     os.makedirs(remote_dir, exist_ok=True)
     to_remote = 0
     to_local  = 0
@@ -2731,7 +2908,10 @@ def _icloud_sync_dirs(local_dir: str, remote_dir: str,
         for entry in os.scandir(d):
             if entry.is_file(follow_symlinks=False):
                 rel = entry.name
-                if exts is None or os.path.splitext(rel)[1].lower() in exts:
+                if name_filter is not None:
+                    if name_filter(rel):
+                        out[rel] = entry.path
+                elif exts is None or os.path.splitext(rel)[1].lower() in exts:
                     out[rel] = entry.path
             elif recursive and entry.is_dir(follow_symlinks=False):
                 for sub_rel, sub_abs in _collect(entry.path).items():
@@ -2746,26 +2926,38 @@ def _icloud_sync_dirs(local_dir: str, remote_dir: str,
         rp = remote_files.get(name)
 
         if lp and not rp:
-            # Only on PC → push to iCloud folder
+            # Only on PC → push to remote folder
             dst = os.path.join(remote_dir, name)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(lp, dst)
+            _atomic_copy(lp, dst)
             to_remote += 1
         elif rp and not lp:
-            # Only in iCloud folder → pull to PC
-            dst = os.path.join(local_dir, name)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(rp, dst)
-            to_local += 1
+            if skip_remote_names and name in skip_remote_names:
+                # Remote-only orphan that belongs to a deleted note → purge it
+                try:
+                    os.remove(rp)
+                except OSError:
+                    pass
+            else:
+                # Only in remote folder → pull to PC
+                dst = os.path.join(local_dir, name)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(rp, dst)
+                to_local += 1
         else:
             lm = os.path.getmtime(lp)
             rm = os.path.getmtime(rp)
             if lm > rm + 1:            # +1 s tolerance for FAT/APFS rounding
-                shutil.copy2(lp, rp)
+                _atomic_copy(lp, rp)
                 to_remote += 1
             elif rm > lm + 1:
-                shutil.copy2(rp, lp)
-                to_local += 1
+                # Guard against iCloud/GDrive async mtime updates: only pull
+                # when content actually differs, not just when remote mtime is newer.
+                if _files_differ(lp, rp):
+                    shutil.copy2(rp, lp)
+                    to_local += 1
+                else:
+                    skipped += 1
             else:
                 skipped += 1
 
@@ -2785,6 +2977,23 @@ def _icloud_do_sync() -> dict:
     local_notes   = paths.get_notes_dir()
     local_attach  = paths.get_attachments_dir()
 
+    # Guard: don't create the remote folder until iCloud has had time to
+    # deliver an existing one from the cloud (avoids myNotes → myNotes(1)).
+    if not os.path.isdir(remote_root):
+        now = time.time()
+        _folder_wait_since.setdefault('icloud', now)
+        elapsed = now - _folder_wait_since['icloud']
+        if elapsed < _CLOUD_FOLDER_WAIT:
+            _icloud_log.info(
+                'Remote folder absent — waiting for iCloud to deliver it '
+                '(%.0f / %.0f s)', elapsed, _CLOUD_FOLDER_WAIT)
+            return {'ok': True, 'toRemote': 0, 'toLocal': 0, 'skipped': 0}
+        _icloud_log.info(
+            'Remote folder still absent after %.0f s — treating as fresh install',
+            elapsed)
+    else:
+        _folder_wait_since.pop('icloud', None)   # folder arrived, reset
+
     # Flatten legacy notes/ subfolder into remote_root before syncing
     _migrate_remote_notes_subdir(remote_root, _icloud_log)
 
@@ -2794,10 +3003,26 @@ def _icloud_do_sync() -> dict:
     try:
         with _icloud_sync_lock:
             _sync_deletion_log(local_notes, remote_notes, local_attach, remote_attach)
-            r1 = _sync_notes_by_id(local_notes, remote_notes)
-            r2 = _icloud_sync_dirs(local_attach, remote_attach,
-                                   recursive=True)
-        total = {k: r1[k] + r2[k] for k in r1}
+            r1   = _sync_notes_by_id(local_notes, remote_notes)
+            # Build skip-sets from the merged deletion log so orphaned remote
+            # files are purged rather than pulled back to local.
+            _del_entries = _load_deletion_log(_deletion_log_path(local_notes))['deletions']
+            _del_hist    = {
+                os.path.splitext(e['path'])[0] + '.history.json'
+                for e in _del_entries if e['type'] == 'note'
+            }
+            # Normalise separators to match os.path.join output used in _collect
+            _del_attach  = {
+                e['path'].replace('/', os.sep)
+                for e in _del_entries if e['type'] == 'attachment'
+            }
+            r1h  = _icloud_sync_dirs(local_notes, remote_notes,
+                                     name_filter=lambda n: n.endswith('.history.json'),
+                                     skip_remote_names=_del_hist)
+            r2   = _icloud_sync_dirs(local_attach, remote_attach,
+                                     recursive=True,
+                                     skip_remote_names=_del_attach)
+        total = {k: r1[k] + r1h[k] + r2[k] for k in r1}
         _icloud_log.info('Sync done → %s', total)
 
         now = time.time()
@@ -2820,6 +3045,11 @@ def _icloud_loop() -> None:
         enabled  = cfg.get('enabled', False)
         interval = int(cfg.get('sync_interval', 300))
         if enabled and cfg.get('connected', False):
+            if time.time() < _editing_until:
+                _icloud_log.debug('Sync skipped — note is being edited')
+                _icloud_wake.clear()
+                _icloud_wake.wait(timeout=min(_EDITING_GRACE, interval))
+                continue
             _icloud_log.debug('Auto-sync starting …')
             _icloud_do_sync()
         _icloud_wake.clear()
@@ -2855,6 +3085,17 @@ threading.Thread(target=_migrate_existing_note_ids,
 
 
 # ── iCloud routes ─────────────────────────────────────────────────────────────
+
+@app.route('/api/editing', methods=['POST'])
+def api_editing():
+    global _editing_until
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get('active'):
+        _editing_until = time.time() + _EDITING_GRACE
+    else:
+        _editing_until = 0.0
+    return '', 204
+
 
 @app.route('/api/icloud', methods=['GET'])
 def get_icloud():
@@ -2898,19 +3139,20 @@ def icloud_setup():
             os.path.join('attachments', 'archives'),
             os.path.join('attachments', 'videos'),
         ]
-        if _has_notes_structure(remote_root):
-            # Folder already exists — only fill in any missing attachment subdirs.
-            # Do NOT create notes/ or any other top-level dir that might trigger
-            # a cloud-client conflict-rename (myNotes → myNotes(1)).
+        if os.path.isdir(remote_root):
+            # Folder already exists (may not be fully downloaded yet — iCloud
+            # shows folders as directories even before their contents arrive).
+            # Only fill in any missing attachment subdirs; never recreate the
+            # root to avoid triggering a conflict-rename (myNotes → myNotes(1)).
             for sub in attach_subs:
                 os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
-            _icloud_log.info('Using existing folder structure at %s', remote_root)
+            _icloud_log.info('Using existing folder at %s', remote_root)
         else:
-            # Fresh folder — notes go directly in remote_root (flat layout)
-            os.makedirs(remote_root, exist_ok=True)
-            for sub in attach_subs:
-                os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
-            _icloud_log.info('Folder structure created at %s', remote_root)
+            # Folder does not exist locally yet — iCloud may still be
+            # downloading it from another device.  Do NOT create it here;
+            # the first sync pass will create it safely via os.makedirs once
+            # the cloud client has had time to resolve its state.
+            _icloud_log.info('Remote folder not present yet — will be created on first sync: %s', remote_root)
 
         cfg = paths._load_config()
         c   = cfg.setdefault('icloud', {})
@@ -2920,6 +3162,7 @@ def icloud_setup():
         c['enabled']       = True
         c['sync_interval'] = int(data.get('syncInterval', 300))
         paths._save_config(cfg)
+        _folder_wait_since.pop('icloud', None)   # fresh window on every setup
         _icloud_wake.set()
         return jsonify({'ok': True})
     except Exception as e:
@@ -3042,6 +3285,22 @@ def _gdrive_do_sync() -> dict:
     local_notes   = paths.get_notes_dir()
     local_attach  = paths.get_attachments_dir()
 
+    # Guard: same delivery-wait logic as iCloud (avoids myNotes → myNotes(1)).
+    if not os.path.isdir(remote_root):
+        now = time.time()
+        _folder_wait_since.setdefault('gdrive', now)
+        elapsed = now - _folder_wait_since['gdrive']
+        if elapsed < _CLOUD_FOLDER_WAIT:
+            _gdrive_log.info(
+                'Remote folder absent — waiting for GDrive to deliver it '
+                '(%.0f / %.0f s)', elapsed, _CLOUD_FOLDER_WAIT)
+            return {'ok': True, 'toRemote': 0, 'toLocal': 0, 'skipped': 0}
+        _gdrive_log.info(
+            'Remote folder still absent after %.0f s — treating as fresh install',
+            elapsed)
+    else:
+        _folder_wait_since.pop('gdrive', None)
+
     # Flatten legacy notes/ subfolder into remote_root before syncing
     _migrate_remote_notes_subdir(remote_root, _gdrive_log)
 
@@ -3051,10 +3310,23 @@ def _gdrive_do_sync() -> dict:
     try:
         with _gdrive_sync_lock:
             _sync_deletion_log(local_notes, remote_notes, local_attach, remote_attach)
-            r1 = _sync_notes_by_id(local_notes, remote_notes)
-            r2 = _icloud_sync_dirs(local_attach, remote_attach,
-                                   recursive=True)
-        total = {k: r1[k] + r2[k] for k in r1}
+            r1   = _sync_notes_by_id(local_notes, remote_notes)
+            _del_entries = _load_deletion_log(_deletion_log_path(local_notes))['deletions']
+            _del_hist    = {
+                os.path.splitext(e['path'])[0] + '.history.json'
+                for e in _del_entries if e['type'] == 'note'
+            }
+            _del_attach  = {
+                e['path'].replace('/', os.sep)
+                for e in _del_entries if e['type'] == 'attachment'
+            }
+            r1h  = _icloud_sync_dirs(local_notes, remote_notes,
+                                     name_filter=lambda n: n.endswith('.history.json'),
+                                     skip_remote_names=_del_hist)
+            r2   = _icloud_sync_dirs(local_attach, remote_attach,
+                                     recursive=True,
+                                     skip_remote_names=_del_attach)
+        total = {k: r1[k] + r1h[k] + r2[k] for k in r1}
         _gdrive_log.info('Sync done → %s', total)
 
         now = time.time()
@@ -3077,6 +3349,11 @@ def _gdrive_loop() -> None:
         enabled  = cfg.get('enabled', False)
         interval = int(cfg.get('sync_interval', 300))
         if enabled and cfg.get('connected', False):
+            if time.time() < _editing_until:
+                _gdrive_log.debug('Sync skipped — note is being edited')
+                _gdrive_wake.clear()
+                _gdrive_wake.wait(timeout=min(_EDITING_GRACE, interval))
+                continue
             _gdrive_log.debug('Auto-sync starting …')
             _gdrive_do_sync()
         _gdrive_wake.clear()
@@ -3132,19 +3409,15 @@ def gdrive_setup():
             os.path.join('attachments', 'archives'),
             os.path.join('attachments', 'videos'),
         ]
-        if _has_notes_structure(remote_root):
+        if os.path.isdir(remote_root):
             # Folder already exists — only fill in any missing attachment subdirs.
-            # Do NOT create notes/ or any other top-level dir that might trigger
-            # a cloud-client conflict-rename (myNotes → myNotes(1)).
             for sub in attach_subs:
                 os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
-            _gdrive_log.info('Using existing folder structure at %s', remote_root)
+            _gdrive_log.info('Using existing folder at %s', remote_root)
         else:
-            # Fresh folder — notes go directly in remote_root (flat layout)
-            os.makedirs(remote_root, exist_ok=True)
-            for sub in attach_subs:
-                os.makedirs(os.path.join(remote_root, sub), exist_ok=True)
-            _gdrive_log.info('Folder structure created at %s', remote_root)
+            # Folder not present locally yet — GDrive may still be downloading
+            # it.  Let the first sync create it to avoid a name-collision rename.
+            _gdrive_log.info('Remote folder not present yet — will be created on first sync: %s', remote_root)
 
         cfg = paths._load_config()
         c   = cfg.setdefault('gdrive', {})
@@ -3154,6 +3427,7 @@ def gdrive_setup():
         c['enabled']       = True
         c['sync_interval'] = int(data.get('syncInterval', 300))
         paths._save_config(cfg)
+        _folder_wait_since.pop('gdrive', None)   # fresh window on every setup
         _gdrive_wake.set()
         return jsonify({'ok': True})
     except Exception as e:
@@ -3729,6 +4003,10 @@ def _parse_notable_fm(text: str):
     fm['attachments'] = (
         [a.strip() for a in m.group(1).split(',') if a.strip()] if m else []
     )
+    # created timestamp — Notable stores as ISO 8601 with possible quotes
+    m = re.search(r"^created:\s*['\"]?([^'\"\n]+)['\"]?\s*$", fm_raw, re.MULTILINE)
+    if m:
+        fm['created'] = m.group(1).strip()
     return fm, body
 
 
@@ -3767,14 +4045,14 @@ def import_notable():
 
     notes_sub = os.path.join(folder, 'notes')
     if not os.path.isdir(notes_sub):
-        # Maybe the folder IS the notes folder already
         notes_sub = folder
     attach_src = os.path.join(folder, 'attachments')
 
     img_dir = _ensure_attach_subdir('images')
     nd      = paths.get_notes_dir()
 
-    md_files = sorted(glob_module.glob(os.path.join(notes_sub, '*.md')))
+    # Recursive scan so notebook subdirectories are included
+    md_files = sorted(glob_module.glob(os.path.join(notes_sub, '**', '*.md'), recursive=True))
     if not md_files:
         return jsonify({'error': 'No .md files found in the specified folder.'}), 400
 
@@ -3784,7 +4062,7 @@ def import_notable():
 
     for src_path in md_files:
         try:
-            with open(src_path, 'r', encoding='utf-8') as fh:
+            with open(src_path, 'r', encoding='utf-8-sig') as fh:
                 raw = fh.read()
 
             fm, body = _parse_notable_fm(raw)
@@ -3817,6 +4095,27 @@ def import_notable():
             with open(dest_md, 'w', encoding='utf-8') as fh:
                 fh.write(content)
 
+            # Write history file so Created: shows the original Notable creation date.
+            # Notable stores: created: '2023-01-01T12:00:00.000Z'
+            created_str = fm.get('created', '')
+            if created_str:
+                try:
+                    # Strip timezone suffix (Z or +HH:MM) before parsing
+                    clean = re.sub(r'[Z+][^.]*$', '', created_str).rstrip('Z')
+                    created_dt = _dtt.fromisoformat(clean)
+                    hist_at = created_dt.strftime('%Y-%m-%dT%H:%M:%S')
+                except Exception:
+                    hist_at = _dtt.now().strftime('%Y-%m-%dT%H:%M:%S')
+            else:
+                hist_at = _dtt.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+            hist_entry = [{'at': hist_at, 'via': 'notable_import', 'act': 'created'}]
+            try:
+                with open(_history_path(dest_md), 'w', encoding='utf-8') as fh:
+                    _json.dump(hist_entry, fh, ensure_ascii=False)
+            except OSError:
+                pass
+
             # Copy attachments
             for att in fm.get('attachments', []):
                 src_att = os.path.join(attach_src, att)
@@ -3831,6 +4130,12 @@ def import_notable():
 
         except Exception as exc:
             errors.append(f'{os.path.basename(src_path)}: {exc}')
+
+    # Wake sync threads so imported notes reach iCloud / GDrive without waiting
+    # for the next scheduled interval.
+    if imported:
+        _icloud_wake.set()
+        _gdrive_wake.set()
 
     return jsonify({
         'imported': len(imported),
@@ -3946,14 +4251,42 @@ if __name__ == '__main__':
                     work = ctypes.wintypes.RECT()
                     ctypes.windll.user32.SystemParametersInfoW(
                         0x0030, 0, ctypes.byref(work), 0)
+
+                    # WS_POPUP frameless windows have a 1 px compositor stub on
+                    # every edge that DWM owns and cannot be queried.  Shift the
+                    # window 1 px past each work-area boundary so that stub lands
+                    # off-screen and the visible content fills flush to the corner.
+                    PAD = 1
                     ctypes.windll.user32.SetWindowPos(
                         hwnd, 0,
-                        work.left, work.top,
-                        work.right  - work.left,
-                        work.bottom - work.top,
+                        work.left  - PAD,
+                        work.top   - PAD,
+                        work.right  - work.left + PAD * 2,
+                        work.bottom - work.top  + PAD * 2,
                         SWP_SHOWWINDOW,
                     )
                     self._maximized = True
+
+            def get_window_rect(self):
+                """Return current window position so JS can compute drag deltas."""
+                hwnd = self._get_main_hwnd()
+                if not hwnd:
+                    return None
+                rect = ctypes.wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                return {'x': rect.left, 'y': rect.top,
+                        'w': rect.right - rect.left, 'h': rect.bottom - rect.top}
+
+            def move_window(self, x, y):
+                """Move the window to absolute screen coordinates (called per mousemove)."""
+                if self._maximized:
+                    return
+                hwnd = self._get_main_hwnd()
+                if hwnd:
+                    SWP_NOSIZE   = 0x0001
+                    SWP_NOZORDER = 0x0004
+                    ctypes.windll.user32.SetWindowPos(
+                        hwnd, 0, int(x), int(y), 0, 0, SWP_NOSIZE | SWP_NOZORDER)
 
             def pick_folder(self):
                 """Open a native OS folder-picker dialog; return the chosen path or None."""
