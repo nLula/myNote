@@ -37,7 +37,7 @@ STATIC_DIR: str = os.path.join(_base_dir(), 'static')
 
 # --- Flask server settings ---
 HOST: str = '127.0.0.1'
-PORT: int = 5000
+PORT: int = 5174
 
 
 # ---------------------------------------------------------------------------

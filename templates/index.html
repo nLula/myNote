@@ -39,7 +39,11 @@
 
     <!-- Column 1: Tags -->
     <div class="col" id="col-tags">
-      <div class="col-header">Tags</div>
+      <div class="col-header">
+        <button class="sync-icon-btn" id="myNote-sync-btn" title="Sync now">
+          <img src="{{ url_for('static', filename='images/myNote.ico') }}" alt="Sync" id="myNote-sync-icon" />
+        </button>
+      </div>
       <ul id="tag-list"></ul>
     </div>
 
@@ -122,6 +126,16 @@
         </div>
       </div>
 
+      <!-- In-note find bar — Ctrl+F in view mode -->
+      <div id="note-find-bar" class="note-find-bar hidden">
+        <input type="text" id="note-find-input" placeholder="Find in note…"
+               autocomplete="off" spellcheck="false" />
+        <span id="note-find-count" class="note-find-count"></span>
+        <button class="note-find-nav" id="note-find-prev" title="Previous (Shift+Enter)">↑</button>
+        <button class="note-find-nav" id="note-find-next" title="Next (Enter)">↓</button>
+        <button class="note-find-close" id="note-find-close" title="Close (Escape)">×</button>
+      </div>
+
       <!-- View mode: rendered markdown -->
       <div id="note-view" class="note-view"></div>
 
@@ -168,15 +182,16 @@
           <div class="settings-nav-divider"></div>
           <div class="settings-nav-item" data-panel="email">Email</div>
           <div class="settings-nav-item" data-panel="telegram">Connect Telegram</div>
-          <div class="settings-nav-item" data-panel="icloud">Connect iPhone</div>
-          <div class="settings-nav-item" data-panel="android">Connect Android</div>
+          <div class="settings-nav-item" data-panel="icloud">iCloud Storage</div>
+          <div class="settings-nav-item" data-panel="android">Google Drive</div>
+          <div class="settings-nav-item" data-panel="github">Connect GitHub</div>
           <div class="settings-nav-item" data-panel="locked">Locked Notes</div>
           <div class="settings-nav-item" data-panel="passwords">Import passwords</div>
           <div class="settings-nav-item" data-panel="notable">Import Notable</div>
           <div class="settings-nav-item" data-panel="trash">Trash</div>
-          <div class="settings-nav-divider"></div>
-          <div class="settings-nav-item" data-panel="storage">Manage Space</div>
         </div>
+        <div class="settings-nav-divider"></div>
+        <div class="settings-nav-item" data-panel="storage">Manage Space</div>
       </div>
       <div class="settings-right-panel">
 
@@ -350,18 +365,12 @@
               </div>
             </div>
             <div class="settings-field-row" style="margin-top:12px">
-              <label class="settings-toggle-label">
-                <input type="checkbox" id="settings-tg-enabled" />
-                <span>Enable polling every</span>
-                <select id="settings-tg-interval" class="tg-interval-select">
-                  <option value="30"   selected>30 s</option>
-                  <option value="300"  >5 m</option>
-                  <option value="600"  >10 m</option>
-                  <option value="900"  >15 m</option>
-                  <option value="1800" >30 m</option>
-                  <option value="3600" >1 h</option>
-                </select>
-              </label>
+              <div class="settings-toggle-label">
+                <div class="interval-bar" id="settings-tg-interval" data-value="30"
+                     data-stops="0,30,60,300,900,1800,3600"
+                     data-labels="Never,30 sec,1 min,5 min,15 min,30 min,1 h"
+                     data-title="Auto-poll interval:"></div>
+              </div>
               <span id="settings-tg-status-conn" class="tg-status"></span>
             </div>
             <div class="settings-actions">
@@ -466,18 +475,11 @@
             </div>
 
             <div class="settings-field-row" style="margin-top:14px">
-              <label class="settings-toggle-label">
-                <input type="checkbox" id="icloud-enabled-chk" />
-                <span>Auto-sync every</span>
-                <select id="icloud-interval-sel" class="tg-interval-select">
-                  <option value="60"   >1 min</option>
-                  <option value="300"  selected>5 min</option>
-                  <option value="600"  >10 min</option>
-                  <option value="900"  >15 min</option>
-                  <option value="1800" >30 min</option>
-                  <option value="3600" >1 h</option>
-                </select>
-              </label>
+              <div class="settings-toggle-label">
+                <div class="interval-bar" id="icloud-interval-sel" data-value="300"
+                     data-stops="0,30,60,300,900,1800,3600"
+                     data-labels="Never,30 sec,1 min,5 min,15 min,30 min,1 h"></div>
+              </div>
             </div>
 
             <div class="settings-actions" style="margin-top:8px">
@@ -585,18 +587,11 @@
             </div>
 
             <div class="settings-field-row" style="margin-top:14px">
-              <label class="settings-toggle-label">
-                <input type="checkbox" id="android-enabled-chk" />
-                <span>Auto-sync every</span>
-                <select id="android-interval-sel" class="tg-interval-select">
-                  <option value="60"   >1 min</option>
-                  <option value="300"  selected>5 min</option>
-                  <option value="600"  >10 min</option>
-                  <option value="900"  >15 min</option>
-                  <option value="1800" >30 min</option>
-                  <option value="3600" >1 h</option>
-                </select>
-              </label>
+              <div class="settings-toggle-label">
+                <div class="interval-bar" id="android-interval-sel" data-value="300"
+                     data-stops="0,30,60,300,900,1800,3600"
+                     data-labels="Never,30 sec,1 min,5 min,15 min,30 min,1 h"></div>
+              </div>
             </div>
 
             <div class="settings-actions" style="margin-top:8px">
@@ -608,6 +603,70 @@
           </div>
 
         </div><!-- /settings-panel-android -->
+
+        <div id="settings-panel-github" class="settings-panel">
+          <h3 class="settings-panel-title">Connect GitHub</h3>
+          <p class="settings-disclaimer">⚠ Files larger than 47 MB will not be synchronized.</p>
+
+          <!-- ── Step 1: Setup ────────────────────────────────────────────── -->
+          <div id="github-step-setup">
+            <div class="tg-guide">
+              <p>myNote syncs your notes and attachments with a <strong>GitHub repository</strong> using the GitHub API.</p>
+              <ol class="tg-guide-steps">
+                <li>Create or choose a GitHub repository for your notes</li>
+                <li>Generate a <strong>Personal Access Token</strong>: GitHub → Settings → Developer settings → Personal access tokens (classic) → with <strong>repo</strong> scope</li>
+                <li>Paste the repository URL and your PAT below</li>
+              </ol>
+            </div>
+            <div class="settings-field">
+              <label for="github-repo-url">Repository URL</label>
+              <input type="text" id="github-repo-url"
+                     placeholder="https://github.com/yourname/myNotes.git"
+                     autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="settings-field">
+              <label for="github-pat">Personal Access Token (PAT)</label>
+              <input type="password" id="github-pat"
+                     placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                     autocomplete="new-password" spellcheck="false" />
+            </div>
+            <p class="settings-disclaimer">⚠ Files larger than 47 MB will not be synchronized.</p>
+            <div class="settings-actions">
+              <span id="github-status-setup" class="tg-status"></span>
+              <button class="btn-primary" id="github-connect-btn">Connect →</button>
+            </div>
+          </div>
+
+          <!-- ── Step 2: Connected ─────────────────────────────────────────── -->
+          <div id="github-step-connected" class="hidden">
+            <div class="tg-info-table">
+              <div class="tg-info-row">
+                <span class="tg-info-label">Repository</span>
+                <span id="github-conn-repo" class="tg-info-value icloud-path-value">—</span>
+              </div>
+              <div class="tg-info-row">
+                <span class="tg-info-label">Last sync</span>
+                <span id="github-conn-lastsync" class="tg-info-value">—</span>
+              </div>
+            </div>
+
+            <div class="settings-field-row" style="margin-top:14px">
+              <div class="settings-toggle-label">
+                <div class="interval-bar" id="github-interval-sel" data-value="300"
+                     data-stops="0,30,60,300,900,1800,3600"
+                     data-labels="Never,30 sec,1 min,5 min,15 min,30 min,1 h"></div>
+              </div>
+            </div>
+
+            <div class="settings-actions" style="margin-top:8px">
+              <span id="github-status-conn" class="tg-status"></span>
+              <button class="btn-secondary" id="github-sync-now-btn">Sync Now</button>
+              <button class="btn-secondary" id="github-disconnect-btn">Disconnect</button>
+              <button class="btn-primary"   id="github-save-btn">Save</button>
+            </div>
+          </div>
+
+        </div><!-- /settings-panel-github -->
 
         <div id="settings-panel-locked" class="settings-panel">
           <h3 class="settings-panel-title">Locked Notes</h3>
@@ -777,6 +836,9 @@
 
   <!-- Sort direction tooltip -->
   <div id="sort-dir-tooltip"></div>
+
+  <!-- Generic button tooltip (replaces native title= in light/dark mode) -->
+  <div id="ui-tooltip"></div>
 
   <!-- Lock / encrypt dialog -->
   <div id="encrypt-dialog" class="modal-overlay hidden">

@@ -43,7 +43,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['static\\images\\myNote.ico'],
+    icon=['static/images/myNote.ico'],
 )
 coll = COLLECT(
     exe,

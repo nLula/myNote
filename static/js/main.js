@@ -17,15 +17,8 @@ const _MEDIA_AUDIO_EXTS = new Set(['mp3','m4a','ogg','oga','wav','flac','aac','o
  * don't confuse the extractor.
  */
 function encodeAttachmentUrls(md) {
-  // Each attachment URL has the shape: /attachments/<subfolder>/<filename>
-  // The filename may contain spaces, Cyrillic, balanced parens, &, etc.
-  // Pattern breakdown:
-  //   \]\(                              – closing ] then opening ( of a markdown link
-  //   (\/attachments\/[^/\n]+\/)        – capture: /attachments/<subfolder>/
-  //   ((?:[^()\n]+|\([^()\n]*\))*)      – capture: filename  (non-paren chars OR balanced (...))
-  //   (?=[)\n]|$)                        – lookahead: must be followed by ) or end-of-line
   return md.replace(
-    /\]\((\/attachments\/[^/\n]+\/)((?:[^()\n]+|\([^()\n]*\))*)\)(?=[)\n]|$)/g,
+    /\]\((\/attachments\/[^/\n]+\/)((?:[^()\n]+|\([^()\n]*\))*)\)/g,
     (match, prefix, rawFilename, ...rest) => {
       // Normalise: decode any existing percent-encoding then re-encode cleanly
       let fname = rawFilename;
@@ -50,14 +43,14 @@ function injectMediaPlayers(html) {
 
       if (_MEDIA_VIDEO_EXTS.has(ext)) {
         return `<div class="note-media-wrap">` +
-                 `<video src="${href}" controls preload="metadata" class="note-media-video"></video>` +
+                 `<video src="${href}" controls preload="none" class="note-media-video"></video>` +
                  `<div class="note-media-label">${fname}</div>` +
                `</div>`;
       }
       if (_MEDIA_AUDIO_EXTS.has(ext)) {
         return `<div class="note-media-wrap note-media-wrap--audio">` +
                  `<div class="note-media-label">${fname}</div>` +
-                 `<audio src="${href}" controls preload="metadata" class="note-media-audio"></audio>` +
+                 `<audio src="${href}" controls preload="none" class="note-media-audio"></audio>` +
                `</div>`;
       }
       return match;
@@ -160,7 +153,11 @@ let noteEncrypted    = false;
 const notePasswords  = new Map(); // noteName → session decryption password
 let autoLockTimer    = null;
 let toastFilePath    = null;
+let titleBaseline    = '';    // heading the open note had when it was loaded
+let openedBody       = '';    // body as loaded, for spotting an untouched editor
 let _editingHbTimer  = null;  // heartbeat interval while editing is active
+let _periodicSaveTimer   = null;  // interval that flushes changes every 5 s
+let _periodicSavedBody   = null;  // body content at the last periodic write
 
 // ── Toolbar meta display ───────────────────────────────────────────────────
 
@@ -202,7 +199,154 @@ function decorateAttachmentLinks(container) {
   });
 }
 
+// ── View ↔ edit scroll sync ────────────────────────────────────────────────
+// Both panes scroll independently, so switching modes has to translate a
+// position in one into the other.  The common currency is the markdown source
+// line: the rendered view is mapped back to source lines through marked's
+// token stream, and the textarea is measured with a hidden mirror div that
+// reproduces its soft-wrapping.
+
+let _editSrcNote = '';   // note whose content the textarea currently holds
+let _viewSrcNote = '';   // note the rendered view currently shows
+let _srcMirror   = null;
+
+/** Hidden div whose text layout matches the textarea's, for line-offset math. */
+function _syncMirror() {
+  if (!_srcMirror) {
+    _srcMirror = document.createElement('div');
+    _srcMirror.setAttribute('aria-hidden', 'true');
+    Object.assign(_srcMirror.style, {
+      position: 'absolute', top: '0', left: '-99999px',
+      visibility: 'hidden', pointerEvents: 'none', border: '0',
+    });
+    document.body.appendChild(_srcMirror);
+  }
+  const cs = getComputedStyle(noteEdit);
+  for (const p of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontVariant',
+                   'letterSpacing', 'lineHeight', 'wordSpacing', 'textIndent',
+                   'textTransform', 'wordBreak', 'overflowWrap', 'tabSize',
+                   'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft'])
+    _srcMirror.style[p] = cs[p];
+  _srcMirror.style.whiteSpace = 'pre-wrap';
+  _srcMirror.style.boxSizing  = 'border-box';
+  _srcMirror.style.width      = noteEdit.clientWidth + 'px';
+  return _srcMirror;
+}
+
+/** Y offset in the textarea's scroll space of the start of source `line`. */
+function _editOffsetForLine(line, lines) {
+  if (line <= 0) return 0;
+  const m = _syncMirror();
+  m.textContent = '';
+  m.appendChild(document.createTextNode(lines.slice(0, line).join('\n') + '\n'));
+  const marker = document.createElement('span');
+  marker.textContent = '​';
+  m.appendChild(marker);
+  return marker.offsetTop;
+}
+
+/** Source line currently at the top of the textarea's viewport. */
+function _editTopLine() {
+  const st = noteEdit.scrollTop;
+  if (st <= 0) return 0;
+  const lines = noteEdit.value.split('\n');
+  // Largest L where offset(L) <= scrollTop
+  let lo = 0, hi = lines.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (_editOffsetForLine(mid, lines) <= st) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+/**
+ * Put the caret on the line directly below the note's heading, scrolled to the
+ * top. This is how the placeholder opens: the heading is left empty and waiting
+ * to be named, so typing should start in the body, not on the '#' line.
+ */
+function _placeCaretBelowHeading() {
+  const lines = noteEdit.value.split('\n');
+  const hIdx  = lines.findIndex(l => /^#/.test(l));
+  const target = hIdx === -1 ? 0 : hIdx + 1;
+  const pos = Math.min(
+    lines.slice(0, target).join('\n').length + (target > 0 ? 1 : 0),
+    noteEdit.value.length
+  );
+  try { noteEdit.setSelectionRange(pos, pos); } catch (_) {}
+  noteEdit.scrollTop = 0;
+}
+
+/** Scroll the textarea so `line` sits at the top, and park the caret there. */
+function _scrollEditToLine(line) {
+  const lines = noteEdit.value.split('\n');
+  const l     = Math.max(0, Math.min(line, lines.length));
+  const idx   = lines.slice(0, l).join('\n').length + (l > 0 ? 1 : 0);
+  try { noteEdit.setSelectionRange(idx, idx); } catch (_) {}
+  noteEdit.scrollTop = _editOffsetForLine(l, lines);
+}
+
+/**
+ * [{ el, line }] pairing each top-level rendered block with the source line it
+ * came from.  marked's top-level tokens map 1:1 onto note-view's children once
+ * whitespace-only tokens (which render nothing) are skipped.
+ */
+function _buildViewLineMap() {
+  const map  = [];
+  const kids = Array.from(noteView.children);
+  if (!kids.length) return map;
+  let tokens;
+  try { tokens = marked.lexer(noteBodyContent); } catch (_) { return map; }
+  let line = 0, ki = 0;
+  for (const t of tokens) {
+    if (t.type !== 'space') {
+      if (ki >= kids.length) break;
+      map.push({ el: kids[ki], line });
+      ki += 1;
+    }
+    line += ((t.raw || '').match(/\n/g) || []).length;
+  }
+  return map;
+}
+
+/** Source line currently at the top of the rendered view's viewport. */
+function _viewTopLine() {
+  const map = _buildViewLineMap();
+  if (!map.length) return null;
+  const vTop = noteView.getBoundingClientRect().top;
+  const st   = noteView.scrollTop;
+  const tops = map.map(m => m.el.getBoundingClientRect().top - vTop + st);
+  if (st <= 0) return map[0].line;
+
+  let i = 0;
+  while (i + 1 < map.length && tops[i + 1] <= st + 2) i += 1;
+  // Interpolate inside the block so long paragraphs don't snap to their start
+  if (i + 1 < map.length) {
+    const span = tops[i + 1] - tops[i];
+    if (span > 0) {
+      const frac = Math.max(0, Math.min(1, (st - tops[i]) / span));
+      return map[i].line + Math.round(frac * (map[i + 1].line - map[i].line));
+    }
+  }
+  return map[i].line;
+}
+
+/** Scroll the rendered view so the block containing `line` sits at the top. */
+function _scrollViewToLine(line) {
+  const map = _buildViewLineMap();
+  if (!map.length) return;
+  let i = 0;
+  while (i + 1 < map.length && map[i + 1].line <= line) i += 1;
+  // At the very first block, show the pane's top padding rather than clipping it
+  if (i === 0) { noteView.scrollTop = 0; return; }
+  const vTop = noteView.getBoundingClientRect().top;
+  noteView.scrollTop = Math.max(0, map[i].el.getBoundingClientRect().top - vTop + noteView.scrollTop);
+}
+
 function enterViewMode() {
+  // Coming back from the editor on the same note — carry the scroll position over
+  const _srcLine = (colContent.classList.contains('editing') && _editSrcNote === activeNote)
+    ? _editTopLine() : null;
+
   if (noteEncrypted && !notePasswords.has(activeNote)) {
     noteView.innerHTML = `
       <div class="encrypted-placeholder">
@@ -218,8 +362,35 @@ function enterViewMode() {
     noteView.innerHTML = injectMediaPlayers(marked.parse(encodeAttachmentUrls(noteBodyContent)));
     decorateAttachmentLinks(noteView);
 
-    // Inject copy buttons into fenced code blocks
+    // Replace broken attachment media with a "not here yet" placeholder
+    noteView.querySelectorAll('img[src^="/attachments/"]').forEach(img => {
+      img.addEventListener('error', () => {
+        const ph = document.createElement('span');
+        ph.className = 'attachment-missing';
+        ph.textContent = 'File is not here yet';
+        img.replaceWith(ph);
+      }, { once: true });
+    });
+    noteView.querySelectorAll('video[src^="/attachments/"], audio[src^="/attachments/"]').forEach(el => {
+      el.addEventListener('error', () => {
+        const wrap = el.closest('.note-media-wrap');
+        const ph = document.createElement('div');
+        ph.className = 'attachment-missing';
+        ph.textContent = 'File is not here yet';
+        (wrap || el).replaceWith(ph);
+      }, { once: true });
+    });
+
+    // Inject copy buttons into fenced code blocks.
+    // The button lives in a wrapper DIV outside <pre> so it isn't inside
+    // pre's horizontal scroll container — otherwise position:absolute right:8px
+    // is computed from the scroll-content edge and the button drifts with code.
     noteView.querySelectorAll('pre').forEach(pre => {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'pre-wrapper';
+      pre.parentNode.insertBefore(wrapper, pre);
+      wrapper.appendChild(pre);
+
       const btn = document.createElement('button');
       btn.className = 'code-copy-btn';
       btn.textContent = 'Copy';
@@ -231,13 +402,17 @@ function enterViewMode() {
           setTimeout(() => { btn.classList.remove('copied'); btn.textContent = 'Copy'; }, 2000);
         }).catch(() => {});
       });
-      pre.appendChild(btn);
+      wrapper.appendChild(btn);
     });
   }
   colContent.classList.remove('editing');
   document.body.classList.remove('editing-active');
   _stopEditingHeartbeat();
+  _stopPeriodicSave();
   _flushPendingUpdate();
+  if (_srcLine !== null) _scrollViewToLine(_srcLine);
+  _viewSrcNote = activeNote;
+  window._noteFindRerun?.();
 }
 
 function _notifyEditing(active) {
@@ -260,17 +435,49 @@ function _stopEditingHeartbeat() {
   _notifyEditing(false);
 }
 
+function _startPeriodicSave() {
+  _periodicSavedBody = noteBodyContent;  // baseline — don't save what's already on disk
+  if (_periodicSaveTimer) return;
+  _periodicSaveTimer = setInterval(async () => {
+    if (!activeNote || !colContent.classList.contains('editing')) return;
+    if (noteBodyContent === _periodicSavedBody) return;  // nothing changed
+    _periodicSavedBody = noteBodyContent;
+    try { await saveCurrentNote(false); } catch (_) {}
+  }, 5000);
+}
+
+function _stopPeriodicSave() {
+  if (_periodicSaveTimer) { clearInterval(_periodicSaveTimer); _periodicSaveTimer = null; }
+  _periodicSavedBody = null;
+}
+
 function enterEditMode() {
   if (noteEncrypted && !notePasswords.has(activeNote)) return;
+  // Only carry a scroll position over when the view is actually showing this
+  // note — opening a different note straight into edit mode has nothing to carry.
+  const _srcLine = (colContent.classList.contains('editing') || _viewSrcNote !== activeNote)
+    ? null : _viewTopLine();
+
+  window._noteFindClose?.();
   noteEdit.value = noteBodyContent;
   colContent.classList.add('editing');
   document.body.classList.add('editing-active');
+  _editSrcNote = activeNote;
   _startEditingHeartbeat();
+  _startPeriodicSave();
   noteEdit.focus();
+  // After focus — focusing a textarea scrolls it to the caret, which would
+  // otherwise undo the restored position.
+  if (_srcLine !== null) _scrollEditToLine(_srcLine);
 }
 
 function clearContentPane() {
   cancelAutoLockTimer();
+  window._noteFindClose?.();
+  _editSrcNote  = '';
+  _viewSrcNote  = '';
+  titleBaseline = '';
+  openedBody    = '';
   noteBodyContent   = '';
   noteRawCiphertext = '';
   noteFrontmatter   = '';
@@ -282,9 +489,10 @@ function clearContentPane() {
   colContent.classList.remove('editing');
   document.body.classList.remove('editing-active');
   _stopEditingHeartbeat();
+  _stopPeriodicSave();
   setMetaDates(null, null);
-  document.getElementById('btn-lock').disabled  = true;
   document.getElementById('btn-trash').disabled = true;
+  updateLockButton();
   updateExportButton();
   updateShareButton();
 }
@@ -300,6 +508,8 @@ function startAutoLockTimer() {
     if (noteEncrypted && activeNote) {
       enterViewMode();
       updateExportButton();
+      updateTrashButton();
+      updateLockButton();
       updateEditTagButtons();
     }
   }, 60000);
@@ -313,10 +523,33 @@ function updateExportButton() {
   document.getElementById('btn-export').disabled = !activeNote || noteEncrypted;
 }
 
+function updateLockButton() {
+  const btn = document.getElementById('btn-lock');
+  if (!activeNote) {
+    btn.disabled = true;
+    return;
+  }
+  btn.disabled = false;
+  const locked = noteEncrypted && !notePasswords.has(activeNote);
+  btn.removeAttribute('title');
+  btn.dataset.tip = locked ? 'Unlock note' : 'Lock note';
+}
+
 function updateShareButton() {
   // Share is available for any open non-encrypted note
   const btn = document.getElementById('btn-share');
   btn.disabled = !activeNote || noteEncrypted;
+}
+
+function updateTrashButton() {
+  // Trash (= "Move to Trash") requires the note to be unlocked first.
+  // In Trash view the button means "Restore", which is always allowed.
+  const inTrash = activeTag === TRASH_TAG;
+  const locked  = noteEncrypted && !notePasswords.has(activeNote);
+  // The placeholder note is never trashable — it is reused, not deleted.
+  const fixture = !inTrash && isPlaceholderName(activeNote);
+  document.getElementById('btn-trash').disabled =
+    !activeNote || (!inTrash && locked) || fixture;
 }
 
 function updateEditTagButtons() {
@@ -370,19 +603,36 @@ function clearMultiSelect() {
   document.getElementById('btn-new').disabled    = false;
   document.getElementById('btn-edit').disabled   = false;
   document.getElementById('btn-tags').disabled   = false;
-  document.getElementById('btn-trash').disabled  = !activeNote;
-  document.getElementById('btn-lock').disabled   = !activeNote;
+  updateTrashButton();
+  updateLockButton();
   updateExportButton();
   updateShareButton();
 }
 
+/**
+ * Text of the note's first "# " heading, or '' when it has none.
+ *
+ * The separator is [ \t] and not \s on purpose: \s matches newlines too, so on
+ * a note whose heading is still empty ("# " with nothing after it — what the
+ * phone writes into its placeholder note) the old pattern ran straight through
+ * the blank lines and captured the first line of the body instead.  That made
+ * the note's own content its title, and saveAndRename then renamed the file
+ * after it.
+ */
 function extractTitle(body) {
-  const m = body.match(/^#\s+(.+)/m);
-  return m ? m[1].trim() : (activeNote || '');
+  const m = body.match(/^#[ \t]+(.+)/m);
+  return m ? m[1].trim() : '';
 }
 
 function sanitizeFilename(name) {
-  return name.replace(/[/\\<>:"|?*]/g, '').trim().slice(0, 100);
+  // Keep Unicode letters/digits/combining marks, space, dot, hyphen, underscore.
+  // Everything else (punctuation, symbols, emoji) → underscore.
+  return name
+    .replace(/[^\p{L}\p{N}\p{M} .\-_]/gu, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .trim()
+    .slice(0, 100) || 'Untitled';
 }
 
 // ── Crypto helpers (AES-GCM + PBKDF2) ─────────────────────────────────────
@@ -442,6 +692,10 @@ function stripEmptyFrontmatter(fm) {
 
 async function saveCurrentNote(sessionEnd = false) {
   if (!activeNote) return;
+  // Did anything actually change during this editing session? openedBody is the
+  // text as loaded, and is re-baselined below on each session end, so this is
+  // "changed since the last save" rather than "changed since the note opened".
+  const contentChanged = noteBodyContent !== openedBody;
   let body = noteBodyContent;
   if (noteEncrypted && notePasswords.has(activeNote)) {
     body = await encryptText(noteBodyContent, notePasswords.get(activeNote));
@@ -455,14 +709,101 @@ async function saveCurrentNote(sessionEnd = false) {
   if (sessionEnd) _invalidateHistoryCache(activeNote);
   noteMtime = Date.now() / 1000;
   metaSecondary.textContent = 'Last change: ' + formatDate(noteMtime);
+
+  // Finishing an editing session pushes the note out straight away rather than
+  // waiting for the interval. session_end is exactly that moment, and every way
+  // of leaving the editor — the Edit toggle, Escape, opening another note,
+  // trashing, starting a new note — routes through here.
+  //
+  // Only when something was actually written, though: merely opening a note and
+  // closing it again is not a reason to go to the network. Re-baseline first so
+  // leaving, re-entering and leaving again doesn't count as a second change.
+  if (sessionEnd) {
+    openedBody = noteBodyContent;
+    // Deliberately not awaited: leaving the editor must not wait on the
+    // network. runSync ignores the call if one is already in flight.
+    if (contentChanged) window._syncNow?.({ silent: true });
+  }
+}
+
+function extractNoteSuffix(noteName) {
+  const m = noteName.match(/_([A-Za-z0-9]{8})$/);
+  return m ? m[1] : null;
+}
+
+// The phone's scratch note. Mirrors _is_placeholder_note / _PLACEHOLDER_TITLE
+// on the backend — it is a fixture that gets emptied and reused, so it is shown
+// under a friendly name and can never be trashed.
+const PLACEHOLDER_BASE  = 'no_name';
+const PLACEHOLDER_TITLE = 'New';
+
+function isPlaceholderName(name) {
+  return String(name || '').replace(/_[A-Za-z0-9]{8}$/, '').toLowerCase() === PLACEHOLDER_BASE;
+}
+
+/**
+ * Whether a finished sync may re-render and reload the open note.
+ *
+ * Never while the user has actually typed something that hasn't been written
+ * back yet; an editor sitting open on unmodified text is fair game.
+ */
+function _canRefreshAfterSync() {
+  if (!_isEditingActive()) return true;
+  return noteBodyContent === openedBody;
+}
+
+/**
+ * Pull the open note's text back off disk straight into the editor.
+ *
+ * Deliberately not openNote(): that saves the note being left before loading
+ * the next one, and on the note already open that writes the stale buffer over
+ * the fresher file the sync just pulled down. Only ever called on an untouched
+ * editor, so there is nothing of the user's to overwrite.
+ */
+async function _reloadEditorBuffer() {
+  if (!activeNote) return;
+  // Locked notes are left alone — re-deriving plaintext here would mean
+  // handling the password path all over again for no benefit.
+  if (noteEncrypted) return;
+  try {
+    const data    = await api(`/api/note/${encodeURIComponent(activeNote)}`);
+    const content = data.content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const fmMatch = content.match(/^(---\s*\n[\s\S]*?\n---\s*\n?)/);
+    if (/^encrypted:\s*true/m.test(fmMatch ? fmMatch[1] : '')) return;
+    noteFrontmatter = fmMatch ? fmMatch[1] : '';
+    noteBodyContent = fmMatch ? content.slice(fmMatch[1].length).trimStart() : content;
+    if (noteEdit.value !== noteBodyContent) noteEdit.value = noteBodyContent;
+    openedBody    = noteBodyContent;
+    titleBaseline = extractTitle(noteBodyContent);
+    noteMtime     = data.mtime ?? noteMtime;
+    setMetaDates(noteCtime, noteMtime);
+  } catch (_) {}
+}
+
+/** What to show in the list for a note with no heading of its own. */
+function fallbackNoteLabel(name) {
+  return isPlaceholderName(name)
+    ? PLACEHOLDER_TITLE
+    : String(name || '').replace(/_[A-Za-z0-9]{8}$/, '');
 }
 
 async function saveAndRename(title) {
   if (!activeNote) return;
   await saveCurrentNote();
 
-  const newName = sanitizeFilename(title);
-  if (!newName || newName === activeNote) return;
+  // The filename only follows the heading, and only when the heading itself
+  // changed since the note was opened.  Editing the body of a note that has no
+  // heading (or an empty one) just saves in place — it must not spawn a second
+  // note named after whatever was typed.
+  const trimmed = (title || '').trim();
+  if (!trimmed || trimmed === titleBaseline) return;
+  titleBaseline = trimmed;
+
+  const newBase = sanitizeFilename(trimmed);
+  if (!newBase) return;
+  const suffix  = extractNoteSuffix(activeNote);
+  const newName = suffix ? `${newBase}_${suffix}` : newBase;
+  if (newName === activeNote) return;
 
   try {
     const result = await api(`/api/note/${encodeURIComponent(activeNote)}/rename`, {
@@ -477,7 +818,19 @@ async function saveAndRename(title) {
     }
     activeNote = result.name;
     const item = document.querySelector(`.note-item[data-name="${CSS.escape(oldName)}"]`);
-    if (item) item.dataset.name = result.name;
+    if (item) {
+      item.dataset.name = result.name;
+      // Renaming away from the placeholder makes it an ordinary note, so drop
+      // the marker styling and re-evaluate the buttons keyed off that state.
+      item.classList.toggle('note-item--placeholder', isPlaceholderName(result.name));
+    }
+    updateTrashButton();
+    if (result.graduated) {
+      // Naming the scratch note turned it into a real one and the backend has
+      // re-armed a fresh blank placeholder — show it, and update the counts.
+      await renderTags(activeTag === TRASH_TAG);
+      await renderNotes();
+    }
   } catch (_) {}
 }
 
@@ -489,7 +842,7 @@ noteEdit.addEventListener('input', () => {
   if (activeItem) {
     const title   = extractTitle(noteBodyContent);
     const textEl  = activeItem.querySelector('.note-item-text');
-    if (textEl) textEl.textContent = title || activeNote;
+    if (textEl) textEl.textContent = title || fallbackNoteLabel(activeNote);
   }
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => saveAndRename(extractTitle(noteBodyContent)), 300);
@@ -500,7 +853,8 @@ noteEdit.addEventListener('input', () => {
 function clipboardImageFilename(mimeType) {
   const ext = mimeType === 'image/jpeg' ? '.jpg' : '.png';
   const d = new Date(), p = n => String(n).padStart(2, '0');
-  return `screenshot-${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${ext}`;
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
+  return `myNoteImage_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}_${ms}${ext}`;
 }
 
 // ── Table paste helpers (Excel / HTML tables / TSV) ───────────────────────
@@ -596,8 +950,7 @@ noteEdit.addEventListener('paste', async e => {
   const imgItem = items.find(i => i.kind === 'file' && i.type.startsWith('image/'));
   if (imgItem) {
     e.preventDefault();
-    await handleAttachment(imgItem.getAsFile(),
-      files.find(f => f.type.startsWith('image/'))?.name || clipboardImageFilename(imgItem.type));
+    await handleAttachment(imgItem.getAsFile(), clipboardImageFilename(imgItem.type));
     return;
   }
   if (files.length) { e.preventDefault(); for (const f of files) await handleAttachment(f, f.name); }
@@ -619,19 +972,53 @@ noteEdit.addEventListener('drop', async e => {
   for (const f of e.dataTransfer.files) await handleAttachment(f, f.name);
 });
 
-noteView.addEventListener('click', async e => {
-  const a = e.target.closest('a');
+/**
+ * Link routing. The WebView treats an ordinary <a> as in-place navigation, which
+ * would replace the whole app UI with the target page and leave no way back — so
+ * every link is intercepted here: attachments open in their native application,
+ * anything external goes to the system default browser.
+ *
+ * Bound on document rather than the note view so links rendered anywhere (setup
+ * wizards, notifications) are covered too; the app shell itself has no anchors.
+ */
+async function _handleLinkActivation(e) {
+  const a = e.target.closest?.('a');
   if (!a) return;
   const href = a.getAttribute('href') || '';
-  if (!href.startsWith('/attachments/')) return;
+  if (!href || href.startsWith('#')) return;   // in-page anchor — leave alone
+
+  if (href.startsWith('/attachments/')) {
+    e.preventDefault();
+    try {
+      const r = await fetch('/api/attachment/open', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: decodeURIComponent(href.slice('/attachments/'.length)) }),
+      });
+      if (!r.ok) showNotif('File is not here yet', 'warn');
+    } catch (_) {}
+    return;
+  }
+
+  // Everything below navigates away from the app, so nothing is left to the
+  // WebView's default handling — note content syncs in from other devices, and
+  // a javascript: href left to default would run script in the app's own origin.
   e.preventDefault();
-  try {
-    await fetch('/api/attachment/open', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: href.slice('/attachments/'.length) }),
-    });
-  } catch (_) {}
-});
+
+  let url = href;
+  if (/^www\./i.test(url)) url = 'https://' + url;   // bare domain, as the WebView would
+  let resolved;
+  try { resolved = new URL(url, window.location.href); } catch (_) { return; }
+
+  if (!['http:', 'https:', 'mailto:', 'tel:', 'ftp:'].includes(resolved.protocol)) {
+    showNotif(`Blocked link with unsupported scheme: ${resolved.protocol}`, 'warn');
+    return;
+  }
+  openExternalUrl(resolved.href);
+}
+
+document.addEventListener('click', _handleLinkActivation);
+// Middle-click / "open in new tab" would otherwise spawn a second app window
+document.addEventListener('auxclick', e => { if (e.button === 1) _handleLinkActivation(e); });
 
 // ── Search ─────────────────────────────────────────────────────────────────
 
@@ -744,12 +1131,27 @@ function _firstLetter(title) {
 
 // ── Notes (col 2) ──────────────────────────────────────────────────────────
 
+function formatNoteDate(ts) {
+  if (!ts) return '';
+  const d       = new Date(ts * 1000);
+  const now     = new Date();
+  const diffMs  = now - d;
+  const diffDay = Math.floor(diffMs / 86400000);
+  if (diffDay === 0) return 'Today ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (diffDay === 1) return 'Yesterday';
+  if (diffDay < 7)  return d.toLocaleDateString([], { weekday: 'long' });
+  return d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+}
+
 async function renderNotes() {
   const sortParams = `sort=${sortBy}&order=${sortDesc ? 'desc' : 'asc'}`;
   let url;
   if (searchQuery) {
     // Search results are not re-sorted server-side (full-text scores govern order)
-    url = `/api/search?q=${encodeURIComponent(searchQuery)}` + (activeTag ? `&tag=${encodeURIComponent(activeTag)}` : '');
+    const unlockedParam = notePasswords.size
+      ? '&unlocked=' + encodeURIComponent([...notePasswords.keys()].join(','))
+      : '';
+    url = `/api/search?q=${encodeURIComponent(searchQuery)}` + (activeTag ? `&tag=${encodeURIComponent(activeTag)}` : '') + unlockedParam;
   } else if (activeTag === TRASH_TAG && trashTagFilter) {
     url = `/api/notes?tag=${encodeURIComponent(TRASH_TAG)}&trash_filter=${encodeURIComponent(trashTagFilter)}&${sortParams}`;
   } else if (activeTag) {
@@ -778,10 +1180,14 @@ async function renderNotes() {
 
   // Build a note list item and attach the standard click handler.
   // lockIconClick — optional extra handler bound to the lock icon (stop-propagated).
-  function makeNoteItem(name, title, encrypted, lockIconClick) {
+  function makeNoteItem(name, title, encrypted, mtime, placeholder, lockIconClick) {
     const li = document.createElement('li');
-    li.className = 'note-item' + (activeNote === name ? ' active' : '');
+    li.className = 'note-item' + (activeNote === name ? ' active' : '')
+                 + (placeholder ? ' note-item--placeholder' : '');
     li.dataset.name = name;
+
+    const row = document.createElement('div');
+    row.className = 'note-item-row';
 
     const lockImg = document.createElement('img');
     lockImg.className = 'note-lock-icon' + (encrypted ? '' : ' hidden');
@@ -794,8 +1200,16 @@ async function renderNotes() {
     const textSpan = document.createElement('span');
     textSpan.className = 'note-item-text';
     textSpan.textContent = title;
-    li.appendChild(lockImg);
-    li.appendChild(textSpan);
+    row.appendChild(lockImg);
+    row.appendChild(textSpan);
+    li.appendChild(row);
+
+    if (mtime) {
+      const metaSpan = document.createElement('span');
+      metaSpan.className = 'note-item-meta';
+      metaSpan.textContent = formatNoteDate(mtime);
+      li.appendChild(metaSpan);
+    }
 
     li.addEventListener('click', e => {
       // Always read data-name at click time — saveAndRename patches it after a
@@ -852,7 +1266,9 @@ async function renderNotes() {
         clearMultiSelect();
         setActiveButton(null);
         if (encrypted) _resetLockedCollapseTimer();
-        openNote(currentName);
+        // The placeholder is a scratchpad — skip the rendered view and drop
+        // straight into the editor, the way the phone opens it.
+        openNote(currentName, isPlaceholderName(currentName));
       }
     });
 
@@ -928,17 +1344,17 @@ async function renderNotes() {
 
       list.appendChild(hdr);
       if (expanded) {
-        groupNotes[letter].forEach(({ name, title, encrypted }) =>
-          list.appendChild(makeNoteItem(name, title, encrypted)));
+        groupNotes[letter].forEach(({ name, title, encrypted, mtime, placeholder }) =>
+          list.appendChild(makeNoteItem(name, title, encrypted, mtime, placeholder)));
       }
     });
 
     // Ungrouped notes appear after all groups
-    ungrouped.forEach(({ name, title, encrypted }) =>
-      list.appendChild(makeNoteItem(name, title, encrypted)));
+    ungrouped.forEach(({ name, title, encrypted, mtime, placeholder }) =>
+      list.appendChild(makeNoteItem(name, title, encrypted, mtime, placeholder)));
   } else {
-    unlockedNotes.forEach(({ name, title, encrypted }) => {
-      list.appendChild(makeNoteItem(name, title, encrypted));
+    unlockedNotes.forEach(({ name, title, encrypted, mtime, placeholder }) => {
+      list.appendChild(makeNoteItem(name, title, encrypted, mtime, placeholder));
     });
   }
 
@@ -982,8 +1398,8 @@ async function renderNotes() {
     list.appendChild(header);
 
     if (lockedGroupExpanded) {
-      lockedNotes.forEach(({ name, title, encrypted }) => {
-        const el = makeNoteItem(name, title, encrypted);
+      lockedNotes.forEach(({ name, title, encrypted, mtime, placeholder }) => {
+        const el = makeNoteItem(name, title, encrypted, mtime, placeholder);
         el.dataset.lockedGroupItem = '1';
         list.appendChild(el);
       });
@@ -1008,9 +1424,10 @@ async function openNote(name, startEditing = false) {
     el.classList.toggle('active', el.dataset.name === name));
 
   const data      = await api(`/api/note/${encodeURIComponent(name)}`);
-  const fmMatch   = data.content.match(/^(---\s*\n[\s\S]*?\n---\s*\n?)/);
+  const content   = data.content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const fmMatch   = content.match(/^(---\s*\n[\s\S]*?\n---\s*\n?)/);
   noteFrontmatter = fmMatch ? fmMatch[1] : '';
-  const rawBody   = fmMatch ? data.content.slice(fmMatch[1].length).trimStart() : data.content;
+  const rawBody   = fmMatch ? content.slice(fmMatch[1].length).trimStart() : content;
 
   noteCtime     = data.ctime ?? null;
   noteMtime     = data.mtime ?? null;
@@ -1020,8 +1437,8 @@ async function openNote(name, startEditing = false) {
   if (noteEncrypted) noteRawCiphertext = rawBody;
   else noteRawCiphertext = '';
 
-  document.getElementById('btn-lock').disabled  = false;
-  document.getElementById('btn-trash').disabled = false;
+  updateTrashButton();
+  updateLockButton();
   updateShareButton();
   setMetaDates(noteCtime, noteMtime);
 
@@ -1035,9 +1452,23 @@ async function openNote(name, startEditing = false) {
   } else {
     noteBodyContent = rawBody;
   }
+  // Baseline for the rename check — a later edit only renames the file if it
+  // moves the heading away from what the note was opened with.
+  titleBaseline = extractTitle(noteBodyContent);
+  // Content as loaded, so a sync finishing later can tell an editor that is
+  // merely open from one the user has actually typed into.
+  openedBody = noteBodyContent;
 
   if (startEditing && activeTag !== TRASH_TAG && !(noteEncrypted && !notePasswords.has(name))) {
     enterEditMode();
+    // The placeholder opens ready to type: caret on the line under the heading,
+    // which is left empty until the note is given a name.  The button state is
+    // only touched here — the new-note flow owns 'new' and uses it as its own
+    // re-entrancy guard, so it must not be overwritten.
+    if (isPlaceholderName(name)) {
+      setActiveButton('edit');
+      _placeCaretBelowHeading();
+    }
   } else {
     enterViewMode();
   }
@@ -1126,6 +1557,9 @@ document.getElementById('encrypt-ok').addEventListener('click', async () => {
     closeEncryptDialog();
     enterViewMode();  // shows blurred placeholder since no session password
     updateExportButton();
+    updateTrashButton();
+    updateLockButton();
+    updateEditTagButtons();
 
   // ── Unlock for session ────────────────────────────────────────────────────
   } else if (encryptDialogMode === 'unlock') {
@@ -1143,6 +1577,8 @@ document.getElementById('encrypt-ok').addEventListener('click', async () => {
       enterViewMode();
       startAutoLockTimer();
       updateExportButton();
+      updateTrashButton();
+      updateLockButton();
       updateEditTagButtons();
       console.debug('[unlock] success, plaintext length:', plain.length);
     } catch (err) {
@@ -1182,6 +1618,8 @@ document.getElementById('encrypt-ok').addEventListener('click', async () => {
         metaSecondary.textContent = 'Last change: ' + formatDate(noteMtime);
         document.getElementById('btn-lock').disabled = false;
         updateShareButton();
+        updateTrashButton();
+        updateLockButton();
         enterViewMode();
         // Remove lock icon from list item
         const item = document.querySelector(`.note-item[data-name="${CSS.escape(activeNote)}"]`);
@@ -1227,6 +1665,9 @@ document.getElementById('btn-lock').addEventListener('click', () => {
       cancelAutoLockTimer();
       enterViewMode();
       updateExportButton();
+      updateTrashButton();
+      updateLockButton();
+      updateEditTagButtons();
     }
   } else {
     openEncryptDialog('lock');
@@ -1318,6 +1759,121 @@ function makeDirtyTracker(saveBtn, fields) {
   };
 }
 
+/**
+ * Open a URL in the system default browser. Uses the pywebview bridge when running inside
+ * the desktop app, and falls back to window.open() when viewed in a plain browser tab so
+ * download links always work in either context.
+ */
+function openExternalUrl(url) {
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.open_url) {
+    window.pywebview.api.open_url(url);
+  } else {
+    window.open(url, '_blank');
+  }
+}
+
+/**
+ * Builds a drag-slider interval control inside the given .interval-bar div.
+ * Reads stops/labels from data-stops and data-labels attributes.
+ * Exposes bar.value getter/setter and dispatches 'change'/'input' on snap.
+ * Value of "0" means "no autosync".
+ */
+function makeIntervalBar(id) {
+  const bar = document.getElementById(id);
+  if (!bar) return null;
+
+  const stops  = (bar.dataset.stops  || '0,30,60,300,900,1800,3600').split(',');
+  const labels = (bar.dataset.labels || stops.join(',')).split(',');
+  const initialVal = bar.dataset.value || stops[0];
+  let currentIdx = Math.max(stops.indexOf(String(initialVal)), 0);
+
+  // Build inner DOM
+  const title = bar.dataset.title || 'Auto-sync interval:';
+  bar.innerHTML = `
+    <div class="interval-bar__label">${title} <strong class="interval-bar__val-text"></strong></div>
+    <div class="interval-bar__track-wrap">
+      <div class="interval-bar__track"></div>
+      <div class="interval-bar__fill"></div>
+      <div class="interval-bar__thumb"></div>
+    </div>
+    <div class="interval-bar__ticks"></div>`;
+
+  const valText  = bar.querySelector('.interval-bar__val-text');
+  const fill     = bar.querySelector('.interval-bar__fill');
+  const thumb    = bar.querySelector('.interval-bar__thumb');
+  const tickWrap = bar.querySelector('.interval-bar__ticks');
+
+  // Build tick marks + labels
+  stops.forEach((_, i) => {
+    const tick = document.createElement('div');
+    tick.className = 'interval-bar__tick';
+    tick.innerHTML = `<div class="interval-bar__tick-mark"></div>
+                      <div class="interval-bar__tick-label">${labels[i] || stops[i]}</div>`;
+    tick.querySelector('.interval-bar__tick-label').addEventListener('click', () => snap(i, true));
+    tickWrap.appendChild(tick);
+  });
+
+  const tickLabels = Array.from(tickWrap.querySelectorAll('.interval-bar__tick-label'));
+
+  function pct(idx) { return stops.length > 1 ? (idx / (stops.length - 1)) * 100 : 0; }
+
+  function paint() {
+    const p = pct(currentIdx);
+    thumb.style.left = p + '%';
+    fill.style.width = p + '%';
+    valText.textContent = labels[currentIdx] || stops[currentIdx];
+    tickLabels.forEach((lbl, i) => lbl.classList.toggle('active', i === currentIdx));
+  }
+
+  function snap(idx, emit) {
+    const prev = currentIdx;
+    currentIdx = Math.max(0, Math.min(stops.length - 1, idx));
+    paint();
+    if (emit && currentIdx !== prev) {
+      bar.dispatchEvent(new Event('change', { bubbles: true }));
+      bar.dispatchEvent(new Event('input',  { bubbles: true }));
+    }
+  }
+
+  // Pointer drag
+  function idxFromPointer(clientX) {
+    const rect = bar.querySelector('.interval-bar__track').getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return Math.round(ratio * (stops.length - 1));
+  }
+
+  thumb.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    thumb.setPointerCapture(e.pointerId);
+    const move = ev => snap(idxFromPointer(ev.clientX), false);
+    const up   = ev => {
+      snap(idxFromPointer(ev.clientX), true);
+      thumb.removeEventListener('pointermove', move);
+      thumb.removeEventListener('pointerup',   up);
+    };
+    thumb.addEventListener('pointermove', move);
+    thumb.addEventListener('pointerup',   up);
+  });
+
+  // Click anywhere on track also snaps
+  bar.querySelector('.interval-bar__track-wrap').addEventListener('click', e => {
+    if (e.target === thumb) return;
+    snap(idxFromPointer(e.clientX), true);
+  });
+
+  Object.defineProperty(bar, 'value', {
+    configurable: true,
+    get() { return stops[currentIdx]; },
+    set(v) {
+      const i = stops.indexOf(String(v));
+      if (i >= 0) { currentIdx = i; paint(); }
+    },
+  });
+
+  paint();
+  return bar;
+}
+
 /** Switch the visible settings panel + highlight the matching nav item. */
 function activateSettingsPanel(panelName) {
   document.querySelectorAll('.settings-nav-item').forEach(i =>
@@ -1326,7 +1882,7 @@ function activateSettingsPanel(panelName) {
     p.classList.toggle('active', p.id === 'settings-panel-' + panelName));
   // Lock/unlock right-panel scroll (storage panel must not scroll)
   document.querySelector('.settings-right-panel').style.overflowY =
-    panelName === 'storage' ? 'hidden' : '';
+    (panelName === 'storage' || panelName === 'locked') ? 'hidden' : '';
 
   // Show the refresh button only on the storage panel
   document.getElementById('storage-refresh-btn').style.display =
@@ -1335,6 +1891,7 @@ function activateSettingsPanel(panelName) {
   if (panelName === 'telegram') loadTelegramSettings();
   if (panelName === 'icloud')   loadIcloudSettings();
   if (panelName === 'android')  loadAndroidSettings();
+  if (panelName === 'github')   loadGithubSettings();
   if (panelName === 'storage')  loadStorageSettings();
   if (panelName === 'trash')    loadTrashSettings();
 }
@@ -1451,10 +2008,11 @@ function tgSetStatus(id, msg, type = '') {
   el.className   = 'tg-status' + (type ? ' ' + type : '');
 }
 
+makeIntervalBar('settings-tg-interval');
+
 const _tgDirty = makeDirtyTracker(
   document.getElementById('settings-tg-save-btn'),
   [document.getElementById('settings-tg-chat'),
-   document.getElementById('settings-tg-enabled'),
    document.getElementById('settings-tg-interval')]
 );
 
@@ -1464,13 +2022,8 @@ async function loadTelegramSettings() {
     if (s.authorized) {
       // Pre-fill the chat input (lives in step 3) and interval selector
       document.getElementById('settings-tg-chat').value      = s.chatId || '';
-      document.getElementById('settings-tg-enabled').checked = s.enabled || false;
-      const ivSel = document.getElementById('settings-tg-interval');
-      if (ivSel) {
-        const iv  = String(s.pollInterval || 30);
-        const opt = ivSel.querySelector(`option[value="${iv}"]`);
-        if (opt) ivSel.value = iv; else ivSel.value = '30';
-      }
+      const tgBar = document.getElementById('settings-tg-interval');
+      if (tgBar) tgBar.value = s.enabled ? String(s.pollInterval || 30) : '0';
       // Show connected account name
       const label = s.username ? `@${s.username}` : (s.name || 'Connected');
       document.getElementById('tg-connected-name').textContent = label;
@@ -1626,9 +2179,10 @@ document.getElementById('settings-tg-change-channel-btn').addEventListener('clic
 
 // Step 4 — save polling config
 document.getElementById('settings-tg-save-btn').addEventListener('click', async () => {
-  const chatId       = document.getElementById('settings-tg-chat').value.trim();
-  const enabled      = document.getElementById('settings-tg-enabled').checked;
-  const pollInterval = parseInt(document.getElementById('settings-tg-interval')?.value || '30', 10);
+  const chatId         = document.getElementById('settings-tg-chat').value.trim();
+  const tgIntervalVal  = parseInt(document.getElementById('settings-tg-interval')?.value || '0', 10);
+  const enabled        = tgIntervalVal !== 0;
+  const pollInterval    = tgIntervalVal || 30;
   try {
     await api('/api/telegram', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1691,10 +2245,11 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
   // Held between steps
   let _icDrivePath = '';
 
+  makeIntervalBar('icloud-interval-sel');
+
   const _icDirty = makeDirtyTracker(
     document.getElementById('icloud-save-btn'),
-    [document.getElementById('icloud-enabled-chk'),
-     document.getElementById('icloud-interval-sel')]
+    [document.getElementById('icloud-interval-sel')]
   );
 
   async function loadIcloudSettings() {
@@ -1705,11 +2260,8 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
         document.getElementById('icloud-conn-drive').textContent    = s.drivePath;
         document.getElementById('icloud-conn-folder').textContent   = s.folder;
         document.getElementById('icloud-conn-lastsync').textContent = s.lastSyncStr;
-        document.getElementById('icloud-enabled-chk').checked       = s.enabled;
-        const ivSel = document.getElementById('icloud-interval-sel');
-        const iv    = String(s.syncInterval);
-        const opt   = [...ivSel.options].find(o => o.value === iv);
-        if (opt) ivSel.value = iv;
+        document.getElementById('icloud-interval-sel').value =
+          s.enabled ? String(s.syncInterval) : '0';
         icSetStep('connected');
         _icDirty.setBaseline();
       } else {
@@ -1752,18 +2304,43 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
 
   // ── Step 1: Open Apple download page ────────────────────────────────────
   document.getElementById('icloud-open-download').addEventListener('click', () => {
-    window.pywebview?.api?.open_url?.('https://updates.cdn-apple.com/2020/windows/001-39935-20200911-1A70AA56-F448-11EA-8CC0-99D41950005E/iCloudSetup.exe');
+    openExternalUrl('https://updates.cdn-apple.com/2020/windows/001-39935-20200911-1A70AA56-F448-11EA-8CC0-99D41950005E/iCloudSetup.exe');
   });
 
   // ── Step 1: Next ─────────────────────────────────────────────────────────
-  document.getElementById('icloud-locate-next-btn').addEventListener('click', () => {
+  document.getElementById('icloud-locate-next-btn').addEventListener('click', async () => {
     const path = document.getElementById('icloud-drive-path').value.trim();
     if (!path) { icStatus('icloud-status-locate', 'Please enter or detect your iCloud Drive path.', 'err'); return; }
     _icDrivePath = path;
+    const folderName = document.getElementById('icloud-folder-name').value.trim() || 'myNotes';
+
+    // Recursively search the drive for an existing myNotes folder (incl. nested ones).
+    // If found, connect to it directly; only fall through to "create folder" if nothing exists.
+    icStatus('icloud-status-locate', 'Searching for an existing myNotes folder…');
+    try {
+      const check = await api(`/api/icloud/check-folder?drivePath=${encodeURIComponent(path)}&folder=${encodeURIComponent(folderName)}`);
+      if (check.exists) {
+        icStatus('icloud-status-locate', `Found existing folder, connecting…`);
+        const r = await api('/api/icloud/setup', {
+          method: 'POST',
+          body: JSON.stringify({ drivePath: check.drivePath, folder: check.folder, syncInterval: 300 }),
+        });
+        if (r.ok) {
+          await loadIcloudSettings();
+          api('/api/icloud/sync', { method: 'POST' }).catch(() => {});
+          icStatus('icloud-status-locate', '');
+          return;
+        }
+        icStatus('icloud-status-locate', r.error || 'Setup failed.', 'err');
+        return;
+      }
+    } catch (e) {
+      // If the check fails for any reason, fall through to the manual create-folder step.
+    }
+
     // Update Step 2 preview labels
     document.getElementById('icloud-tree-root-label').textContent =
       `📁 ${path.split(/[\\/]/).pop() || path} /`;
-    const folderName = document.getElementById('icloud-folder-name').value.trim() || 'myNotes';
     document.getElementById('icloud-folder-preview').textContent = folderName;
     icStatus('icloud-status-locate', '');
     icSetStep('folder');
@@ -1783,11 +2360,12 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
   // ── Step 2: Create & Connect ─────────────────────────────────────────────
   document.getElementById('icloud-folder-create-btn').addEventListener('click', async () => {
     const folder = document.getElementById('icloud-folder-name').value.trim() || 'myNotes';
+    const syncInterval = 300;
     icStatus('icloud-status-folder', 'Creating folders…');
     try {
       const r = await api('/api/icloud/setup', {
         method: 'POST',
-        body: JSON.stringify({ drivePath: _icDrivePath, folder, syncInterval: 300 }),
+        body: JSON.stringify({ drivePath: _icDrivePath, folder, syncInterval }),
       });
       if (r.ok) {
         // Refresh and show connected step
@@ -1823,8 +2401,9 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
 
   // ── Step 3: Save ─────────────────────────────────────────────────────────
   document.getElementById('icloud-save-btn').addEventListener('click', async () => {
-    const enabled  = document.getElementById('icloud-enabled-chk').checked;
-    const interval = parseInt(document.getElementById('icloud-interval-sel').value, 10);
+    const icIntervalVal = parseInt(document.getElementById('icloud-interval-sel').value, 10);
+    const enabled  = icIntervalVal !== 0;
+    const interval = icIntervalVal || 300;
     try {
       const r = await api('/api/icloud', {
         method: 'POST',
@@ -1864,10 +2443,14 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
     icStatus('icloud-status-conn', msg, 'ok');
     setTimeout(() => icStatus('icloud-status-conn', ''), 4000);
     // Refresh sidebar to pick up notes added, modified, or removed by sync
-    if (!_isEditingActive()) {
+    if (_canRefreshAfterSync()) {
+      const wasEditing = colContent.classList.contains('editing');
       renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(async () => {
         // If sync downloaded anything, reload the open note in case it was updated
-        if ((r.toLocal || 0) > 0 && activeNote) await openNote(activeNote);
+        if ((r.toLocal || 0) > 0 && activeNote) {
+          if (wasEditing) await _reloadEditorBuffer();
+          else            await openNote(activeNote);
+        }
       });
     }
   });
@@ -1902,10 +2485,11 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
 
   let _gdDrivePath = '';
 
+  makeIntervalBar('android-interval-sel');
+
   const _gdDirty = makeDirtyTracker(
     document.getElementById('android-save-btn'),
-    [document.getElementById('android-enabled-chk'),
-     document.getElementById('android-interval-sel')]
+    [document.getElementById('android-interval-sel')]
   );
 
   async function loadAndroidSettings() {
@@ -1916,11 +2500,8 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
         document.getElementById('android-conn-drive').textContent    = s.drivePath;
         document.getElementById('android-conn-folder').textContent   = s.folder;
         document.getElementById('android-conn-lastsync').textContent = s.lastSyncStr;
-        document.getElementById('android-enabled-chk').checked       = s.enabled;
-        const ivSel = document.getElementById('android-interval-sel');
-        const iv    = String(s.syncInterval);
-        const opt   = [...ivSel.options].find(o => o.value === iv);
-        if (opt) ivSel.value = iv;
+        document.getElementById('android-interval-sel').value =
+          s.enabled ? String(s.syncInterval) : '0';
         gdSetStep('connected');
         _gdDirty.setBaseline();
       } else {
@@ -1961,18 +2542,42 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
 
   // ── Step 1: Open Google Drive download page ──────────────────────────────
   document.getElementById('android-open-download').addEventListener('click', () => {
-    window.pywebview?.api?.open_url?.(
-      'https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe');
+    openExternalUrl('https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe');
   });
 
   // ── Step 1: Next ─────────────────────────────────────────────────────────
-  document.getElementById('android-locate-next-btn').addEventListener('click', () => {
+  document.getElementById('android-locate-next-btn').addEventListener('click', async () => {
     const path = document.getElementById('android-drive-path').value.trim();
     if (!path) { gdStatus('android-status-locate', 'Please enter or detect your Google Drive path.', 'err'); return; }
     _gdDrivePath = path;
+    const folderName = document.getElementById('android-folder-name').value.trim() || 'myNotes';
+
+    // Recursively search the drive for an existing myNotes folder (incl. nested ones).
+    // If found, connect to it directly; only fall through to "create folder" if nothing exists.
+    gdStatus('android-status-locate', 'Searching for an existing myNotes folder…');
+    try {
+      const check = await api(`/api/gdrive/check-folder?drivePath=${encodeURIComponent(path)}&folder=${encodeURIComponent(folderName)}`);
+      if (check.exists) {
+        gdStatus('android-status-locate', `Found existing folder, connecting…`);
+        const r = await api('/api/gdrive/setup', {
+          method: 'POST',
+          body: JSON.stringify({ drivePath: check.drivePath, folder: check.folder, syncInterval: 300 }),
+        });
+        if (r.ok) {
+          await loadAndroidSettings();
+          api('/api/gdrive/sync', { method: 'POST' }).catch(() => {});
+          gdStatus('android-status-locate', '');
+          return;
+        }
+        gdStatus('android-status-locate', r.error || 'Setup failed.', 'err');
+        return;
+      }
+    } catch (e) {
+      // If the check fails for any reason, fall through to the manual create-folder step.
+    }
+
     document.getElementById('android-tree-root-label').textContent =
       `📁 ${path.split(/[\\/]/).pop() || path} /`;
-    const folderName = document.getElementById('android-folder-name').value.trim() || 'myNotes';
     document.getElementById('android-folder-preview').textContent = folderName;
     gdStatus('android-status-locate', '');
     gdSetStep('folder');
@@ -1992,11 +2597,12 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
   // ── Step 2: Create & Connect ─────────────────────────────────────────────
   document.getElementById('android-folder-create-btn').addEventListener('click', async () => {
     const folder = document.getElementById('android-folder-name').value.trim() || 'myNotes';
+    const syncInterval = 300;
     gdStatus('android-status-folder', 'Creating folders…');
     try {
       const r = await api('/api/gdrive/setup', {
         method: 'POST',
-        body: JSON.stringify({ drivePath: _gdDrivePath, folder, syncInterval: 300 }),
+        body: JSON.stringify({ drivePath: _gdDrivePath, folder, syncInterval }),
       });
       if (r.ok) {
         await loadAndroidSettings();
@@ -2030,8 +2636,9 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
 
   // ── Step 3: Save ─────────────────────────────────────────────────────────
   document.getElementById('android-save-btn').addEventListener('click', async () => {
-    const enabled  = document.getElementById('android-enabled-chk').checked;
-    const interval = parseInt(document.getElementById('android-interval-sel').value, 10);
+    const gdIntervalVal = parseInt(document.getElementById('android-interval-sel').value, 10);
+    const enabled  = gdIntervalVal !== 0;
+    const interval = gdIntervalVal || 300;
     try {
       const r = await api('/api/gdrive', {
         method: 'POST',
@@ -2070,10 +2677,298 @@ document.getElementById('settings-tg-logout-btn').addEventListener('click', asyn
     const msg = `Auto-sync — ↑${r.toRemote} to Drive, ↓${r.toLocal} to PC`;
     gdStatus('android-status-conn', msg, 'ok');
     setTimeout(() => gdStatus('android-status-conn', ''), 4000);
-    if (!_isEditingActive()) {
+    if (_canRefreshAfterSync()) {
+      const wasEditing = colContent.classList.contains('editing');
       renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(async () => {
-        if ((r.toLocal || 0) > 0 && activeNote) await openNote(activeNote);
+        if ((r.toLocal || 0) > 0 && activeNote) {
+          if (wasEditing) await _reloadEditorBuffer();
+          else            await openNote(activeNote);
+        }
       });
+    }
+  });
+})();
+
+// ── GitHub sync settings ────────────────────────────────────────────────────
+(function () {
+  function ghSetStep(step) {
+    document.getElementById('github-step-setup').classList.toggle('hidden', step !== 'setup');
+    document.getElementById('github-step-connected').classList.toggle('hidden', step !== 'connected');
+  }
+
+  function ghStatus(id, msg, level = '') {
+    const el = document.getElementById(id);
+    el.textContent = msg;
+    el.className   = 'tg-status' + (level ? ' ' + level : '');
+  }
+
+  async function loadGithubSettings() {
+    const s = await api('/api/github');
+    if (s.connected) {
+      document.getElementById('github-conn-repo').textContent      = s.repoUrl;
+      document.getElementById('github-conn-lastsync').textContent  = s.lastSyncStr;
+      document.getElementById('github-interval-sel').value =
+        s.enabled ? String(s.syncInterval) : '0';
+      _ghDirty.markClean();
+      ghSetStep('connected');
+    } else {
+      ghSetStep('setup');
+    }
+  }
+  window.loadGithubSettings = loadGithubSettings;
+
+  makeIntervalBar('github-interval-sel');
+
+  const _ghDirty = makeDirtyTracker(
+    document.getElementById('github-save-btn'),
+    [document.getElementById('github-interval-sel')]
+  );
+
+  // Connect
+  document.getElementById('github-connect-btn').addEventListener('click', async () => {
+    const repoUrl      = document.getElementById('github-repo-url').value.trim();
+    const pat          = document.getElementById('github-pat').value.trim();
+    const syncInterval = 300;
+    if (!repoUrl || !pat) {
+      ghStatus('github-status-setup', 'Enter the repository URL and PAT.', 'error');
+      return;
+    }
+    ghStatus('github-status-setup', 'Connecting…');
+    document.getElementById('github-connect-btn').disabled = true;
+    try {
+      const r = await api('/api/github/setup', {
+        method: 'POST',
+        body: JSON.stringify({ repoUrl, pat, syncInterval }),
+      });
+      if (r.ok) {
+        document.getElementById('github-pat').value = '';
+        await loadGithubSettings();
+        api('/api/github/sync', { method: 'POST' }).catch(() => {});
+      } else {
+        ghStatus('github-status-setup', r.error || 'Connection failed.', 'error');
+      }
+    } catch (e) {
+      ghStatus('github-status-setup', 'Connection failed.', 'error');
+    } finally {
+      document.getElementById('github-connect-btn').disabled = false;
+    }
+  });
+
+  // Save
+  document.getElementById('github-save-btn').addEventListener('click', async () => {
+    const ghIntervalVal = parseInt(document.getElementById('github-interval-sel').value, 10);
+    const enabled      = ghIntervalVal !== 0;
+    const syncInterval = ghIntervalVal || 300;
+    await api('/api/github', {
+      method: 'POST',
+      body: JSON.stringify({ enabled, syncInterval }),
+    });
+    _ghDirty.markClean();
+    ghStatus('github-status-conn', 'Saved.', 'ok');
+    setTimeout(() => ghStatus('github-status-conn', ''), 2500);
+  });
+
+  // Sync Now
+  document.getElementById('github-sync-now-btn').addEventListener('click', async () => {
+    ghStatus('github-status-conn', 'Syncing…');
+    const btn = document.getElementById('github-sync-now-btn');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/github/sync', { method: 'POST' });
+      if (!r.ok) {
+        ghStatus('github-status-conn', `Sync error: ${r.error || 'unknown'}`, 'error');
+        return;
+      }
+      document.getElementById('github-conn-lastsync').textContent = new Date().toLocaleString();
+      const msg = `Synced — ↑${r.toRemote ?? 0} to GitHub, ↓${r.toLocal ?? 0} to PC`;
+      ghStatus('github-status-conn', msg, 'ok');
+      setTimeout(() => ghStatus('github-status-conn', ''), 4000);
+      if (_canRefreshAfterSync() && (r.toLocal ?? 0) > 0) {
+        const wasEditing = colContent.classList.contains('editing');
+        await renderTags(activeTag === TRASH_TAG);
+        await renderNotes();
+        if (activeNote) {
+          if (wasEditing) await _reloadEditorBuffer();
+          else            await openNote(activeNote);
+        }
+      }
+    } catch (e) {
+      ghStatus('github-status-conn', 'Sync failed.', 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // Disconnect
+  document.getElementById('github-disconnect-btn').addEventListener('click', async () => {
+    if (!confirm('Disconnect GitHub sync? Your notes will not be affected.')) return;
+    await api('/api/github', { method: 'DELETE' });
+    ghStatus('github-status-setup', '');
+    document.getElementById('github-repo-url').value = '';
+    document.getElementById('github-pat').value      = '';
+    ghSetStep('setup');
+  });
+
+  // SSE: background sync result
+  document.addEventListener('sse-github_sync', e => {
+    const r = e.detail?.result;
+    if (!r) return;
+    document.getElementById('github-conn-lastsync').textContent =
+      new Date().toLocaleString();
+    const msg = `Auto-sync — ↑${r.toRemote} to GitHub, ↓${r.toLocal} to PC`;
+    ghStatus('github-status-conn', msg, 'ok');
+    setTimeout(() => ghStatus('github-status-conn', ''), 4000);
+    if (_canRefreshAfterSync()) {
+      const wasEditing = colContent.classList.contains('editing');
+      renderTags(activeTag === TRASH_TAG).then(() => renderNotes()).then(async () => {
+        if ((r.toLocal || 0) > 0 && activeNote) {
+          if (wasEditing) await _reloadEditorBuffer();
+          else            await openNote(activeNote);
+        }
+      });
+    }
+  });
+})();
+
+// ── myNote sync icon (Tags column header) ───────────────────────────────────
+
+(function () {
+  const btn  = document.getElementById('myNote-sync-btn');
+  const icon = document.getElementById('myNote-sync-icon');
+  if (!btn || !icon) return;
+
+  const DEFAULT_TITLE = 'Sync now';
+  const FADE_MS = 20000;
+  let fadeTimer = null;
+  let queuedSync = null;   // a run requested while one was already in flight
+
+  // Background (cron-triggered) syncs that are currently in flight, keyed by
+  // source name. The icon spins whenever this is non-empty OR a manual click
+  // is in progress, and only stops once every source has reported "end".
+  const autoActive = new Set();
+
+  function updateSpin() {
+    const spinning = autoActive.size > 0 || btn.classList.contains('syncing');
+    icon.classList.toggle('sync-spin', spinning);
+    if (spinning) btn.title = 'Syncing…';
+  }
+
+  function flash(ok, message) {
+    clearTimeout(fadeTimer);
+    btn.classList.remove('sync-flash-ok', 'sync-flash-err');
+    btn.style.transition = 'none';
+    btn.classList.add(ok ? 'sync-flash-ok' : 'sync-flash-err');
+    btn.title = message;
+    // Force the "no transition" state to apply before re-enabling it,
+    // so the border starts solid and then eases back to grey.
+    void btn.offsetWidth;
+    requestAnimationFrame(() => {
+      btn.style.transition = `border-color ${FADE_MS}ms ease`;
+      btn.classList.remove('sync-flash-ok', 'sync-flash-err');
+    });
+    fadeTimer = setTimeout(() => {
+      btn.style.transition = '';
+      btn.title = DEFAULT_TITLE;
+    }, FADE_MS);
+  }
+
+  /**
+   * Sync, then bring the UI back in line with what's on disk.
+   *
+   * alwaysRefresh re-renders even when the sync pulled nothing — that's what F5
+   * is for, where the point is an explicit "show me the current state", not just
+   * reacting to incoming changes.
+   *
+   * silent is for syncs the user didn't ask for by hand (leaving the editor):
+   * the icon still spins so the activity is visible, but a run that moved
+   * nothing stays quiet instead of flashing "0 0" every time a note is closed.
+   * Failures always flash.
+   */
+  async function runSync({ alwaysRefresh = false, silent = false } = {}) {
+    // A request that arrives mid-sync is remembered rather than dropped: it is
+    // usually a second note being closed while the first one's push is still in
+    // flight, and its changes would otherwise wait for the next interval.
+    if (btn.classList.contains('syncing')) {
+      queuedSync = { alwaysRefresh: alwaysRefresh || (queuedSync?.alwaysRefresh ?? false),
+                     silent: silent && (queuedSync?.silent ?? true) };
+      return;
+    }
+    clearTimeout(fadeTimer);
+    btn.classList.add('syncing');
+    btn.classList.remove('sync-flash-ok', 'sync-flash-err');
+    btn.style.transition = '';
+    updateSpin();
+    // The note open when the sync started; if the user has moved on by the time
+    // it finishes, reopening it would yank them back.
+    const startedOn = activeNote;
+    try {
+      const r = await api('/api/github/sync', { method: 'POST' });
+      btn.classList.remove('syncing');
+      updateSpin();
+      if (r && r.ok) {
+        const moved = (r.toRemote ?? 0) + (r.toLocal ?? 0);
+        if (!silent || moved > 0) flash(true, `↑${r.toRemote ?? 0} ↓${r.toLocal ?? 0}`);
+        // An open editor normally blocks the refresh so nothing is yanked out
+        // from under the typist. An editor that is merely open and untouched —
+        // the scratch note on startup, which opens straight into edit mode — has
+        // nothing to lose, so it does get the freshly pulled text.
+        if (_canRefreshAfterSync() && (alwaysRefresh || (r.toLocal ?? 0) > 0)) {
+          const wasEditing = colContent.classList.contains('editing');
+          await renderTags(activeTag === TRASH_TAG);
+          await renderNotes();
+          if (activeNote && activeNote === startedOn) {
+            if (wasEditing) await _reloadEditorBuffer();
+            else            await openNote(activeNote);
+          }
+        }
+      } else {
+        flash(false, (r && r.error) ? r.error : 'Sync failed');
+      }
+    } catch (e) {
+      btn.classList.remove('syncing');
+      updateSpin();
+      flash(false, e.message || 'Sync failed');
+      // The sync failed, but the on-disk state may still have moved on
+      if (alwaysRefresh && !_isEditingActive()) {
+        try {
+          await renderTags(activeTag === TRASH_TAG);
+          await renderNotes();
+        } catch (_) {}
+      }
+    } finally {
+      btn.classList.remove('syncing');
+      updateSpin();
+      if (queuedSync) {
+        const next = queuedSync;
+        queuedSync = null;
+        runSync(next);
+      }
+    }
+  }
+
+  btn.addEventListener('click', () => runSync());
+  window._syncNow = runSync;
+
+  // Background cron-triggered syncs (iCloud, Google Drive, GitHub, Telegram)
+  // also spin the icon, so the user knows a sync is happening even when they
+  // didn't click it themselves.
+  document.addEventListener('sse-auto_sync', e => {
+    const ev = e.detail;
+    if (!ev || !ev.source) return;
+    if (ev.phase === 'start') {
+      autoActive.add(ev.source);
+      updateSpin();
+    } else if (ev.phase === 'end') {
+      autoActive.delete(ev.source);
+      updateSpin();
+      // Don't stomp on a flash from a manual click still fading out.
+      if (!btn.classList.contains('syncing') && autoActive.size === 0) {
+        if (ev.ok) {
+          flash(true, `↑${ev.toRemote ?? 0} ↓${ev.toLocal ?? 0}`);
+        } else {
+          flash(false, ev.error || 'Sync failed');
+        }
+      }
     }
   });
 })();
@@ -2346,10 +3241,10 @@ document.getElementById('btn-new').addEventListener('click', async () => {
   activeNote = '';
 
   try {
-    const { name } = await api('/api/next-untitled');
-    await api('/api/note', {
+    const { name: baseName } = await api('/api/next-untitled');
+    const { name: createdName } = await api('/api/note', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, content: `# ${name}\n` }),
+      body: JSON.stringify({ name: baseName, content: `# ${baseName}\n` }),
     });
 
     if (activeTag !== '') {
@@ -2360,7 +3255,7 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     }
 
     await renderNotes();
-    await openNote(name, true);
+    await openNote(createdName, true);
   } finally {
     _isCreatingNote = false;
   }
@@ -2586,7 +3481,8 @@ document.getElementById('btn-trash').addEventListener('click', async () => {
 
   if (selectedNotes.size >= 2) {
     // ── Multi-select: trash / restore every selected note ──
-    const names = [...selectedNotes];
+    // The placeholder is skipped rather than failing the whole batch.
+    const names = [...selectedNotes].filter(n => inTrash || !isPlaceholderName(n));
     for (const n of names) {
       try {
         await api(`/api/note/${encodeURIComponent(n)}/${endpoint}`, { method: 'POST' });
@@ -2604,6 +3500,8 @@ document.getElementById('btn-trash').addEventListener('click', async () => {
 
   // ── Single note ──
   if (!activeNote) return;
+  if (endpoint === 'trash' && isPlaceholderName(activeNote)) return;
+  if (endpoint === 'trash' && noteEncrypted && !notePasswords.has(activeNote)) return;
   if (endpoint === 'trash') {
     clearTimeout(saveTimer);
     if (colContent.classList.contains('editing')) await saveCurrentNote(true);
@@ -2729,6 +3627,13 @@ _noteTitleEl.addEventListener('mouseout', e => {
   _hideHistoryTooltip();
 });
 
+_noteTitleEl.addEventListener('wheel', e => {
+  const tip = _tooltipEl();
+  if (!tip || tip.classList.contains('hidden')) return;
+  e.preventDefault();
+  tip.scrollTop += e.deltaY;
+}, { passive: false });
+
 // ── Collapse locked group on outside click ──────────────────────────────────
 // When expanded but no note is currently session-unlocked, any click that
 // isn't on the group header or one of its expanded items collapses the group.
@@ -2748,6 +3653,9 @@ document.addEventListener('click', e => {
 document.addEventListener('keydown', async e => {
   if (e.key !== 'Escape') return;
 
+  if (!document.getElementById('note-find-bar').classList.contains('hidden')) {
+    window._noteFindClose?.(); return;
+  }
   if (!encryptDialog.classList.contains('hidden')) { closeEncryptDialog(); return; }
   if (!settingsModal.classList.contains('hidden'))  { closeSettings();       return; }
   if (!tagPopover.classList.contains('tag-popover-hidden')) {
@@ -2773,6 +3681,16 @@ document.addEventListener('keydown', async e => {
     document.querySelectorAll('.note-item').forEach(el => el.classList.remove('active'));
     if (wasLocked) _collapseLockedGroup();
   }
+});
+
+// ── F5 → sync, then re-render from disk ─────────────────────────────────────
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'F5' && e.code !== 'F5') return;
+  // Never let the WebView reload the page itself — that would drop unsaved
+  // editor state and restart the app shell rather than refreshing the notes.
+  e.preventDefault();
+  if (typeof window._syncNow === 'function') window._syncNow({ alwaysRefresh: true });
 });
 
 // ── Global Delete key → trash selected / active note ────────────────────────
@@ -3184,6 +4102,10 @@ function _handleNotesUpdated(ev) {
       document.dispatchEvent(new CustomEvent('sse-icloud_sync', { detail: ev }));
     } else if (ev.type === 'gdrive_sync') {
       document.dispatchEvent(new CustomEvent('sse-gdrive_sync', { detail: ev }));
+    } else if (ev.type === 'github_sync') {
+      document.dispatchEvent(new CustomEvent('sse-github_sync', { detail: ev }));
+    } else if (ev.type === 'auto_sync') {
+      document.dispatchEvent(new CustomEvent('sse-auto_sync', { detail: ev }));
     }
   };
 
@@ -3194,6 +4116,23 @@ function _handleNotesUpdated(ev) {
   };
 })();
 
+// ── Flush pending edit on unexpected close ─────────────────────────────────
+// Backstop for closes that skip the custom title-bar button (Alt+F4, taskbar
+// close, browser tab close in dev mode). beforeunload can't await a normal
+// fetch, so fire a keepalive request that's allowed to outlive the page.
+window.addEventListener('beforeunload', () => {
+  if (!activeNote || !colContent.classList.contains('editing')) return;
+  clearTimeout(saveTimer);
+  let body = noteBodyContent;
+  if (noteEncrypted && notePasswords.has(activeNote)) body = noteRawCiphertext;
+  fetch(`/api/note/${encodeURIComponent(activeNote)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: noteFrontmatter + body, session_end: true }),
+    keepalive: true,
+  }).catch(() => {});
+});
+
 // ── pywebview frameless title bar ─────────────────────────────────────────
 
 // pywebview injects window.pywebview and fires 'pywebviewready' once the
@@ -3203,7 +4142,24 @@ function _handleNotesUpdated(ev) {
 window.addEventListener('pywebviewready', function () {
   document.documentElement.classList.add('webview-app');
 
-  document.getElementById('tb-close').addEventListener('click', function () {
+  document.getElementById('tb-close').addEventListener('click', async function () {
+    // Flush the last edit (with a real history entry) before the window — and
+    // the whole process — goes away. Without this, an edit made right before
+    // closing never gets a "changed" entry: the debounced auto-save writes the
+    // .md file but only a session_end save appends to .history.json.
+    // Reuses the same finalize path as "click outside the editor" so new-note
+    // and edit-mode sessions are both handled consistently — and awaiting it
+    // here matters: clicking the close button also fires that outside-click
+    // handler (mousedown fires before click), but it doesn't block this click
+    // handler, so without this await api.close() could destroy the window —
+    // and kill the whole process — before that save finishes.
+    try {
+      if (activeButton === 'new' || activeButton === 'edit') {
+        await _finalizeNewNote('tb-close');
+      }
+    } catch (e) {
+      console.error('[close] final save failed:', e);
+    }
     window.pywebview.api.close();
   });
 
@@ -3295,6 +4251,58 @@ _sortDirEl.addEventListener('mouseleave', () => {
   _sortDirTooltip.style.display = 'none';
 });
 
+// ── Generic button tooltip ─────────────────────────────────────────────────
+// Replaces native browser title= tooltips on <button> elements so they
+// respect the app's current theme (light/dark) instead of the OS default.
+// Uses event delegation so dynamically-set .title (e.g. btn-trash) is caught
+// on each hover without needing a MutationObserver.
+(function () {
+  const tip = document.getElementById('ui-tooltip');
+  let _cur = null;
+
+  document.addEventListener('mouseover', e => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+
+    // Capture title attribute each time — handles dynamic changes like btn-trash
+    if (btn.hasAttribute('title')) {
+      btn.dataset.tip = btn.getAttribute('title');
+      btn.removeAttribute('title');   // suppress native tooltip
+    }
+    const text = btn.dataset.tip;
+    if (!text) return;
+
+    _cur = btn;
+    tip.textContent = text;
+    tip.style.display = 'block';
+
+    const r   = btn.getBoundingClientRect();
+    const cx  = Math.round(r.left + r.width / 2);
+    const tw  = tip.offsetWidth;
+    const th  = tip.offsetHeight;
+    const gap = 5;
+
+    // Prefer below; flip above if not enough space
+    let top = r.bottom + gap;
+    if (top + th > window.innerHeight) top = r.top - th - gap;
+
+    // Centre horizontally, clamp to viewport
+    let left = cx - tw / 2;
+    left = Math.max(6, Math.min(left, window.innerWidth - tw - 6));
+
+    tip.style.top  = Math.round(top)  + 'px';
+    tip.style.left = Math.round(left) + 'px';
+  });
+
+  document.addEventListener('mouseout', e => {
+    if (!_cur) return;
+    if (!_cur.contains(e.relatedTarget)) {
+      tip.style.display = 'none';
+      _cur = null;
+    }
+  });
+})();
+
 async function _saveSortPrefs() {
   try {
     await api('/api/prefs', {
@@ -3334,4 +4342,305 @@ document.querySelectorAll('.sort-btn').forEach(btn => {
   await renderTags();
   await renderNotes();
   await checkWorkfolder();
+
+  // Sync on open. Until now the first thing shown was whatever was on disk when
+  // the app last closed, so a note written on the phone only appeared on the
+  // *next* launch. Not awaited: the list above is already usable, and this
+  // re-renders it once the notes have come down.
+  window._syncNow?.({ alwaysRefresh: true, silent: true });
+})();
+
+// ── In-note find bar (Ctrl+F, both view and edit mode) ─────────────────────
+
+(function () {
+  const bar   = document.getElementById('note-find-bar');
+  const input = document.getElementById('note-find-input');
+  const count = document.getElementById('note-find-count');
+  let matches = [];          // view mode: <mark> elements; edit mode: {start,end}
+  let idx     = -1;
+  let editing = false;       // which pane the current match list belongs to
+
+  const _inEditMode = () => colContent.classList.contains('editing');
+
+  function open() {
+    // Switching panes with the bar already open invalidates the match list
+    if (!bar.classList.contains('hidden') && editing !== _inEditMode()) _clear();
+    editing = _inEditMode();
+    bar.classList.remove('hidden');
+    input.focus();
+    input.select();
+    if (input.value.trim()) _run(input.value.trim());
+  }
+
+  function close() {
+    bar.classList.add('hidden');
+    _clear();
+    matches = [];
+    idx     = -1;
+    count.textContent = '';
+    if (editing && _inEditMode()) noteEdit.focus();
+  }
+
+  // ── Edit-mode highlight backdrop ────────────────────────────────────────
+  // A textarea can't hold <mark> elements, so matches are painted on a div
+  // placed directly behind it with the same font, padding, wrapping and scroll
+  // offset. Its text is transparent, so all the user sees is the highlight
+  // boxes under the real text the textarea draws on top.
+  let hl = null;
+
+  const _esc = t => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  function _hlSyncScroll() {
+    if (!hl) return;
+    hl.scrollTop  = noteEdit.scrollTop;
+    hl.scrollLeft = noteEdit.scrollLeft;
+  }
+
+  function _hlLayout(el) {
+    const cs = getComputedStyle(noteEdit);
+    for (const prop of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle',
+                        'letterSpacing', 'lineHeight', 'wordSpacing', 'textIndent',
+                        'textTransform', 'wordBreak', 'overflowWrap', 'tabSize',
+                        'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft'])
+      el.style[prop] = cs[prop];
+    el.style.boxSizing = 'border-box';
+    // clientWidth/Height rather than offset*: they exclude the scrollbar, so the
+    // backdrop wraps at exactly the column the textarea wraps at.
+    el.style.left   = noteEdit.offsetLeft + 'px';
+    el.style.top    = noteEdit.offsetTop + 'px';
+    el.style.width  = noteEdit.clientWidth + 'px';
+    el.style.height = noteEdit.clientHeight + 'px';
+  }
+
+  function _hlPaint(active) {
+    if (!hl) {
+      hl = document.createElement('div');
+      hl.className = 'note-edit-highlights';
+      hl.setAttribute('aria-hidden', 'true');
+      noteEdit.parentNode.insertBefore(hl, noteEdit);
+      noteEdit.addEventListener('scroll', _hlSyncScroll);
+    }
+    _hlLayout(hl);
+    const text = noteEdit.value;
+    let html = '', cursor = 0;
+    matches.forEach((m, i) => {
+      html += _esc(text.slice(cursor, m.start));
+      html += '<mark class="search-hl' + (i === active ? ' search-hl--active' : '') + '">'
+            + _esc(text.slice(m.start, m.end)) + '</mark>';
+      cursor = m.end;
+    });
+    // The trailing newline keeps the last line's box from collapsing.
+    hl.innerHTML = html + _esc(text.slice(cursor)) + String.fromCharCode(10);
+    noteEdit.classList.add('has-highlights');
+    _hlSyncScroll();
+  }
+
+  function _hlRemove() {
+    if (hl) {
+      noteEdit.removeEventListener('scroll', _hlSyncScroll);
+      hl.remove();
+      hl = null;
+    }
+    noteEdit.classList.remove('has-highlights');
+  }
+
+  function _clear() {
+    _hlRemove();
+    const parents = new Set();
+    noteView.querySelectorAll('mark.search-hl').forEach(m => {
+      const p = m.parentNode;
+      m.replaceWith(document.createTextNode(m.textContent));
+      if (p) parents.add(p);
+    });
+    parents.forEach(p => p.normalize());
+  }
+
+  function _run(q) {
+    _clear();
+    matches = [];
+    idx     = -1;
+    editing = _inEditMode();
+    if (!q) { count.textContent = ''; return; }
+
+    if (editing) { _runEdit(q); return; }
+
+    const lq = q.toLowerCase();
+    const walker = document.createTreeWalker(noteView, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        let p = node.parentElement;
+        while (p && p !== noteView) {
+          if (p.tagName === 'MARK' || p.tagName === 'SCRIPT' || p.tagName === 'STYLE')
+            return NodeFilter.FILTER_REJECT;
+          p = p.parentElement;
+        }
+        return node.textContent.toLowerCase().includes(lq)
+          ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+      }
+    });
+
+    // Collect all match positions per text node
+    const byNode = new Map();
+    let node;
+    while ((node = walker.nextNode())) {
+      const text  = node.textContent;
+      const lower = text.toLowerCase();
+      const hits  = [];
+      let start = 0, i;
+      while ((i = lower.indexOf(lq, start)) !== -1) {
+        hits.push({ start: i, end: i + q.length });
+        start = i + 1;
+      }
+      if (hits.length) byNode.set(node, hits);
+    }
+
+    // Replace each text node with a fragment containing <mark> spans
+    byNode.forEach((hits, node) => {
+      const text   = node.textContent;
+      const parent = node.parentNode;
+      const frag   = document.createDocumentFragment();
+      let cursor   = 0;
+
+      hits.forEach(({ start, end }) => {
+        if (cursor < start) frag.appendChild(document.createTextNode(text.slice(cursor, start)));
+        const m = document.createElement('mark');
+        m.className   = 'search-hl';
+        m.textContent = text.slice(start, end);
+        frag.appendChild(m);
+        cursor = end;
+      });
+
+      if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+      parent.replaceChild(frag, node);
+    });
+
+    // Collect in DOM order (querySelectorAll guarantees this)
+    matches = Array.from(noteView.querySelectorAll('mark.search-hl'));
+
+    if (matches.length) {
+      idx = 0;
+      _activate(0);
+    } else {
+      count.textContent = 'No matches';
+    }
+  }
+
+  /** Edit mode: collect match offsets in the raw textarea text. */
+  function _runEdit(q) {
+    const text = noteEdit.value;
+    const lq   = q.toLowerCase();
+    const lt   = text.toLowerCase();
+    let start = 0, i;
+    while ((i = lt.indexOf(lq, start)) !== -1) {
+      matches.push({ start: i, end: i + q.length });
+      start = i + 1;
+    }
+    if (matches.length) {
+      idx = 0;
+      _activate(0);
+    } else {
+      count.textContent = 'No matches';
+    }
+  }
+
+  function _activate(i) {
+    if (editing) {
+      const m = matches[i];
+      if (!m) return;
+      // Select the hit so it stays visible while focus remains in the find box,
+      // then centre it vertically using the same line metrics as the mode switch.
+      noteEdit.setSelectionRange(m.start, m.end);
+      _hlPaint(i);
+      const lines = noteEdit.value.slice(0, m.start).split('\n');
+      const off   = _editOffsetForLine(lines.length - 1, noteEdit.value.split('\n'));
+      noteEdit.scrollTop = Math.max(0, off - noteEdit.clientHeight / 2);
+      _hlSyncScroll();
+      count.textContent = `${i + 1} of ${matches.length}`;
+      return;
+    }
+    matches.forEach((m, j) => m.classList.toggle('search-hl--active', j === i));
+    matches[i]?.scrollIntoView({ block: 'center', inline: 'nearest' });
+    count.textContent = `${i + 1} of ${matches.length}`;
+  }
+
+  function step(dir) {
+    if (!matches.length) return;
+    idx = (idx + dir + matches.length) % matches.length;
+    _activate(idx);
+  }
+
+  input.addEventListener('input',   () => _run(input.value.trim()));
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  { e.preventDefault(); step(e.shiftKey ? -1 : 1); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+
+  // Typing moves every offset, so recompute and repaint — without touching the
+  // selection or scroll, which would yank the caret away mid-keystroke.
+  function _hlRefresh() {
+    if (bar.classList.contains('hidden') || !_inEditMode()) return;
+    const q = input.value.trim();
+    if (!q) return;
+    matches = [];
+    const lt = noteEdit.value.toLowerCase(), lq = q.toLowerCase();
+    let start = 0, at;
+    while ((at = lt.indexOf(lq, start)) !== -1) {
+      matches.push({ start: at, end: at + q.length });
+      start = at + 1;
+    }
+    if (!matches.length) {
+      _hlRemove();
+      idx = -1;
+      count.textContent = 'No matches';
+      return;
+    }
+    if (idx < 0 || idx >= matches.length) idx = 0;
+    _hlPaint(idx);
+    count.textContent = `${idx + 1} of ${matches.length}`;
+  }
+  noteEdit.addEventListener('input', _hlRefresh);
+  // The backdrop is absolutely positioned, so it has to follow the textarea.
+  window.addEventListener('resize', () => { if (hl) _hlPaint(idx); });
+
+  document.getElementById('note-find-prev').addEventListener('click', () => step(-1));
+  document.getElementById('note-find-next').addEventListener('click', () => step(1));
+  document.getElementById('note-find-close').addEventListener('click', close);
+
+  // Ctrl+F / Cmd+F opens the bar in both view and edit mode.
+  // Matched on e.code (physical key) rather than e.key, so it keeps working
+  // under non-Latin keyboard layouts where the F key reports e.g. Cyrillic 'а'.
+  document.addEventListener('keydown', e => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    if (e.code !== 'KeyF' && e.key !== 'f' && e.key !== 'F') return;
+    if (!activeNote) return;
+    e.preventDefault();
+    open();
+  });
+
+  // Re-run after enterViewMode rebuilds innerHTML (new note or refresh)
+  window._noteFindRerun = () => {
+    if (!bar.classList.contains('hidden') && input.value.trim())
+      setTimeout(() => _run(input.value.trim()), 0);
+  };
+
+  // Close hook called from enterEditMode() and clearContentPane()
+  window._noteFindClose = close;
+})();
+
+// ── Activity-based auto-lock (reset 60 s idle timer on user interaction) ───
+
+(function () {
+  let _throttle = null;
+
+  function _resetOnActivity() {
+    if (!noteEncrypted || !notePasswords.has(activeNote)) return;
+    if (_throttle) return;
+    _throttle = setTimeout(() => { _throttle = null; }, 1000);
+    startAutoLockTimer();  // cancels existing timer and starts a fresh 60 s countdown
+  }
+
+  // Mouse movement, clicks, and scrolling inside the view area all count as activity
+  noteView.addEventListener('mousemove', _resetOnActivity);
+  noteView.addEventListener('click',     _resetOnActivity);
+  noteView.addEventListener('scroll',    _resetOnActivity);
+  noteView.addEventListener('keydown',   _resetOnActivity);
 })();

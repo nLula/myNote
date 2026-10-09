@@ -13,11 +13,23 @@ import json as _json
 import socket as _socket
 import shutil
 import ctypes
+import hashlib as _hashlib
 import urllib.parse as _urlparse
 import requests
 import paths
 import json
+import sys as _sys
 import uuid as _uuid_mod
+
+# Console output must never be able to fail. On Windows stdout defaults to the
+# legacy ANSI codepage, so printing a note name (or any non-ASCII text) from a
+# request handler raises UnicodeEncodeError — which Flask turns into a 500 and
+# which, on the save path, blocks switching away from the note entirely.
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass   # None under a windowed PyInstaller build, or already suitable
 
 app = Flask(
     __name__,
@@ -178,6 +190,50 @@ def _read_history(fp: str) -> list:
     except (OSError, ValueError):
         return []
 
+def _history_ts(entry: dict) -> float:
+    """Epoch seconds for a history entry's 'at', or 0.0 if unreadable.
+
+    The two apps write different shapes and this is the only place they meet:
+    the PC writes naive LOCAL time ('2026-09-27T10:46:37') while the phone
+    writes UTC with a Z and milliseconds ('2026-09-27T07:32:43.451Z').  Compared
+    as strings, or parsed as if both were the same clock, entries from the two
+    devices land in the wrong order by exactly the UTC offset — so each form is
+    resolved to a real instant here.
+    """
+    from datetime import datetime as _dt, timezone as _tzmod
+    raw = str(entry.get('at', '')).strip()
+    if not raw:
+        return 0.0
+    utc = raw.endswith('Z')
+    if utc:
+        raw = raw[:-1]
+    for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            dt = _dt.strptime(raw, fmt)
+        except ValueError:
+            continue
+        # A 'Z' timestamp is UTC; a bare one is this machine's local time.
+        dt = dt.replace(tzinfo=_tzmod.utc) if utc else dt.astimezone()
+        return dt.timestamp()
+    return 0.0
+
+
+def _note_entry_time(fp: str) -> float:
+    """When this note's content was last entered, as epoch seconds.
+
+    The history sidecar is the authority because both apps write it at edit
+    time; file mtime is the fallback, since a synced copy carries the mtime of
+    whenever it was written locally rather than when it was typed."""
+    times = [_history_ts(e) for e in _read_history(fp)]
+    times = [t for t in times if t > 0]
+    if times:
+        return max(times)
+    try:
+        return os.path.getmtime(fp)
+    except OSError:
+        return 0.0
+
+
 _HISTORY_SESSION_WINDOW = 15 * 60  # seconds — edits within this gap are merged
 
 # Maps realpath(fp) → note content at the time the last history entry was written.
@@ -219,18 +275,82 @@ def _append_history(fp: str, act: str, via: str) -> None:
 # Utilities
 # ---------------------------------------------------------------------------
 
+_SUFFIX_RE = re.compile(r'_[A-Za-z0-9]{8}$')
+
+
+def _strip_note_suffix(stem: str) -> str:
+    """Remove trailing _XXXXXXXX suffix from a note filename stem."""
+    return _SUFFIX_RE.sub('', stem)
+
+
+# The phone app keeps a scratch note called no_name.md as a place to start
+# typing before a note has a name.  On the PC it is shown as "New" and marked
+# out in the list; while it is still blank there is nothing to show at all.
+_PLACEHOLDER_BASE  = 'no_name'
+_PLACEHOLDER_TITLE = 'New'
+
+
+def _is_placeholder_note(stem: str) -> bool:
+    """True for the phone app's unnamed scratch note (with or without suffix)."""
+    return _strip_note_suffix(stem).lower() == _PLACEHOLDER_BASE
+
+
+_PLACEHOLDER_TEMPLATE = '# \n\n'
+
+
+def _ensure_placeholder_note(notes_dir: 'str | None' = None) -> None:
+    """Re-arm the scratch note: create a blank no_name.md when none exists.
+
+    Called after the placeholder graduates into a real note, so the standing
+    "start typing here" entry is immediately available again — the same thing
+    the phone does when its scratch note is promoted."""
+    notes_dir = notes_dir or paths.get_notes_dir()
+    fp = os.path.join(notes_dir, _PLACEHOLDER_BASE + '.md')
+    if os.path.exists(fp):
+        return
+    try:
+        # newline='' keeps the exact LF bytes the phone writes — letting Windows
+        # translate to CRLF would make the same blank template differ between
+        # devices, and the two would then overwrite each other on every sync.
+        with open(fp, 'w', encoding='utf-8', newline='') as f:
+            f.write(_PLACEHOLDER_TEMPLATE)
+    except OSError:
+        pass
+
+
+def _strip_placeholder_deletions(deletions: list) -> list:
+    """Drop any deletion-log entry for the phone's placeholder note.
+
+    The placeholder is a permanent fixture on the phone, not a real note: it is
+    emptied and reused rather than created and destroyed.  Recording it as
+    deleted makes every device refuse to accept it again, so the phone appears
+    to save into it while the note never actually syncs.  Filtering on every
+    read/write also heals logs that already carry such an entry, and — because
+    the merged log is what gets pushed — removes it from the shared copy."""
+    out = []
+    for e in deletions:
+        if e.get('type') == 'note' and _is_placeholder_note(
+                os.path.splitext(str(e.get('path', '')))[0]):
+            continue
+        out.append(e)
+    return out
+
+
 def _extract_title(filepath: str) -> str:
     """Return text of the first # heading in the note body, or the filename."""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
     except OSError:
-        return os.path.splitext(os.path.basename(filepath))[0]
+        return _strip_note_suffix(os.path.splitext(os.path.basename(filepath))[0])
     body = re.sub(r'^---\s*\n[\s\S]*?\n---\s*\n?', '', content).lstrip()
-    m = re.search(r'^#\s+(.+)', body, re.MULTILINE)
-    if m:
+    # [ \t] rather than \s: \s matches newlines, so a note whose heading is
+    # still empty ('# ' with nothing after it) would otherwise take its first
+    # body line as the title.
+    m = re.search(r'^#[ \t]+(.+)', body, re.MULTILINE)
+    if m and m.group(1).strip():
         return m.group(1).strip()
-    return os.path.splitext(os.path.basename(filepath))[0]
+    return _strip_note_suffix(os.path.splitext(os.path.basename(filepath))[0])
 
 
 def _note_files():
@@ -272,28 +392,40 @@ def _find_note_by_title(title: str):
 
 
 def _sanitize_filename(name: str) -> str:
-    """Strip emoji, OS-reserved chars, and control chars; keep all scripts."""
-    out = []
-    for c in name:
-        cp = ord(c)
-        # Control characters
-        if cp <= 0x1F:
-            continue
-        # Windows / POSIX reserved characters
-        if c in r'<>:"/\|?*':
-            continue
-        # Above BMP (> U+FFFF) — virtually all emoji (😀 🏁 🙈 etc.)
-        if cp > 0xFFFF:
-            continue
-        # Misc Symbols U+2600–U+26FF  (☀ ☎ ♥ ✓ …)
-        # Dingbats     U+2700–U+27BF  (✂ ✈ ✉ …)
-        if 0x2600 <= cp <= 0x27BF:
-            continue
-        # Variation selectors and ZWJ used in emoji sequences
-        if cp in (0x200D, 0xFE0E, 0xFE0F) or 0xFE00 <= cp <= 0xFE0F:
-            continue
-        out.append(c)
-    return ''.join(out).strip()[:100]
+    """Keep Unicode letters/digits/combining marks, space, dot, hyphen, underscore.
+    Everything else (punctuation, symbols, emoji, control chars) → underscore."""
+    import re as _re
+    # \w matches Unicode word chars (letters, digits, underscore) in Python 3
+    result = _re.sub(r'[^\w .\-]', '_', name)
+    result = _re.sub(r'_+', '_', result).strip('_').strip()[:100]
+    return result
+
+
+import random as _random, string as _string
+
+_NOTE_SUFFIX_LEN = 8
+_NOTE_SUFFIX_CHARS = _string.ascii_letters + _string.digits
+
+
+def _random_note_suffix() -> str:
+    return ''.join(_random.choices(_NOTE_SUFFIX_CHARS, k=_NOTE_SUFFIX_LEN))
+
+
+def _unique_suffixed_name(base: str, notes_dir: str) -> str:
+    """Return 'base_SUFFIX' where SUFFIX is 8 random alphanumeric chars that
+    are not already used on disk or recorded in the deletion log."""
+    del_paths = {
+        e['path']
+        for e in _load_deletion_log(_deletion_log_path(notes_dir))['deletions']
+    }
+    for _ in range(50):
+        suffix = _random_note_suffix()
+        full   = f'{base}_{suffix}'
+        fp     = os.path.join(notes_dir, full + '.md')
+        if not os.path.exists(fp) and (full + '.md') not in del_paths:
+            return full
+    # Practically unreachable fallback
+    return f'{base}_{int(time.time() * 1000) % 100_000_000}'
 
 
 def _safe_path(name: str) -> str:
@@ -321,13 +453,8 @@ def index():
 
 @app.route('/api/next-untitled')
 def api_next_untitled():
-    existing = {os.path.splitext(os.path.basename(f))[0] for f in _note_files()}
-    if 'Untitled' not in existing:
-        return jsonify({'name': 'Untitled'})
-    i = 2
-    while f'Untitled{i}' in existing:
-        i += 1
-    return jsonify({'name': f'Untitled{i}'})
+    # Suffix added at creation time makes every note unique — just return base name.
+    return jsonify({'name': 'Untitled'})
 
 
 @app.route('/api/tags')
@@ -380,6 +507,9 @@ def api_notes():
             if tag and tag not in fm_tags:
                 continue
         name = os.path.splitext(os.path.basename(fp))[0]
+        # The placeholder is always listed, empty or not — it is the standing
+        # "start typing here" note, the same fixture the phone opens into.
+        is_placeholder = _is_placeholder_note(name)
         # Prefer history "created" timestamp over st_ctime, which resets on copy
         fs_ctime = os.path.getctime(fp)
         true_ctime = fs_ctime
@@ -391,31 +521,35 @@ def api_notes():
                     pass
                 break
         entries.append({
-            'name':      name,
-            'title':     _extract_title(fp),
-            'encrypted': fm.get('encrypted', False),
-            '_ctime':    true_ctime,
-            '_mtime':    os.path.getmtime(fp),
+            'name':        name,
+            'title':       _PLACEHOLDER_TITLE if is_placeholder else _extract_title(fp),
+            'encrypted':   fm.get('encrypted', False),
+            'mtime':       os.path.getmtime(fp),
+            'placeholder': is_placeholder,
+            '_ctime':      true_ctime,
         })
     sort_by  = request.args.get('sort',  'ctime')   # ctime | alpha | mtime
     sort_desc = request.args.get('order', 'desc') == 'desc'
     if sort_by == 'alpha':
         entries.sort(key=lambda e: e['title'].lower(), reverse=sort_desc)
     elif sort_by == 'mtime':
-        entries.sort(key=lambda e: e['_mtime'], reverse=sort_desc)
+        entries.sort(key=lambda e: e['mtime'], reverse=sort_desc)
     else:  # ctime (default)
         entries.sort(key=lambda e: e['_ctime'], reverse=sort_desc)
-    return jsonify([{k: v for k, v in e.items() if k.startswith('_') is False}
+    return jsonify([{k: v for k, v in e.items() if not k.startswith('_')}
                     for e in entries])
 
 
 @app.route('/api/search')
 def api_search():
-    q   = request.args.get('q', '').strip().lower()
-    tag = request.args.get('tag', '').strip()
+    q       = request.args.get('q', '').strip().lower()
+    tag     = request.args.get('tag', '').strip()
+    raw_ul  = request.args.get('unlocked', '').strip()
+    unlocked = set(raw_ul.split(',')) if raw_ul else set()
     results = []
     for fp in _note_files():
-        fm_tags    = _read_frontmatter(fp).get('tags', [])
+        fm         = _read_frontmatter(fp)
+        fm_tags    = fm.get('tags', [])
         is_trashed = TRASH_TAG in fm_tags
         if tag == TRASH_TAG:
             if not is_trashed:
@@ -424,14 +558,33 @@ def api_search():
             if is_trashed:
                 continue
         name      = os.path.splitext(os.path.basename(fp))[0]
-        encrypted = _read_frontmatter(fp).get('encrypted', False)
+        encrypted = fm.get('encrypted', False)
+
+        is_placeholder = _is_placeholder_note(name)
+        title = _PLACEHOLDER_TITLE if is_placeholder else _extract_title(fp)
+
+        # Always match on filename
         if not q or q in name.lower():
-            results.append({'name': name, 'title': _extract_title(fp), 'encrypted': encrypted})
+            results.append({'name': name, 'title': title, 'encrypted': encrypted,
+                            'mtime': os.path.getmtime(fp), 'placeholder': is_placeholder})
             continue
+
+        # Locked encrypted notes: skip body search entirely
+        if encrypted and name not in unlocked:
+            continue
+
         try:
             with open(fp, 'r', encoding='utf-8') as f:
-                if q in f.read().lower():
-                    results.append({'name': name, 'title': _extract_title(fp), 'encrypted': encrypted})
+                raw = f.read()
+            # Strip YAML frontmatter so searches don't match id/tags/etc.
+            if raw.startswith('---'):
+                end = raw.find('\n---', 3)
+                body = raw[end + 4:] if end != -1 else raw
+            else:
+                body = raw
+            if q in body.lower():
+                results.append({'name': name, 'title': title, 'encrypted': encrypted,
+                                'mtime': os.path.getmtime(fp), 'placeholder': is_placeholder})
         except OSError:
             pass
     return jsonify(results)
@@ -468,22 +621,25 @@ def api_note(name):
 
 @app.route('/api/note', methods=['POST'])
 def api_create_note():
-    data    = request.get_json(force=True)
-    name    = (data.get('name') or '').strip()
-    content = data.get('content', '')
-    if not name or re.search(r'[/\\<>:"|?*]', name) or name.startswith('.'):
+    data      = request.get_json(force=True)
+    base_name = (data.get('name') or '').strip()
+    content   = data.get('content', '')
+    if not base_name or re.search(r'[/\\<>:"|?*]', base_name) or base_name.startswith('.'):
         abort(400)
-    if name.lower() in _RESERVED_NAMES:
+    if base_name.lower() in _RESERVED_NAMES:
         abort(400)
-    fp = os.path.join(paths.get_notes_dir(), name + '.md')
-    if os.path.exists(fp):
-        abort(409)
+    notes_dir = paths.get_notes_dir()
+    # Always generate a unique random suffix so the filename is globally unique
+    # and can never be confused with a deletion-log entry from a previous note
+    # with the same title.
+    full_name = _unique_suffixed_name(_sanitize_filename(base_name), notes_dir)
+    fp = os.path.join(notes_dir, full_name + '.md')
     with open(fp, 'w', encoding='utf-8') as f:
         f.write(content)
     _inject_note_id(fp)
     _append_history(fp, 'created', 'myNote')
     _last_history_content[os.path.realpath(fp)] = content
-    return jsonify({'name': name}), 201
+    return jsonify({'name': full_name}), 201
 
 
 @app.route('/api/note/<path:name>', methods=['PATCH'])
@@ -498,17 +654,27 @@ def api_save_note(name):
     with open(fp, 'w', encoding='utf-8') as f:
         f.write(content)
     _inject_note_id(fp)
+    # Content typed into the scratch note starts its forced-sync countdown. The
+    # editor autosaves every few seconds, so this fires without the user having
+    # to save or close anything. Whitespace-only edits don't count as content.
+    if _is_placeholder_note(os.path.splitext(os.path.basename(fp))[0]):
+        body = re.sub(r'^---\s*\n[\s\S]*?\n---\s*\n?', '', content)
+        if any(line.strip().lstrip('#').strip() for line in body.splitlines()):
+            _placeholder_mark_dirty()
     if session_end:
         # Compare against content at last history write, not last auto-save, so
         # frequent auto-saves don't mask real changes at session-end time.
         last_hist = _last_history_content.get(real_fp)
         changed   = (last_hist is None) or (content != last_hist)
         if changed:
-            print(f'[hist] PATCH {name!r} act=changed session_end=True → history_written=True')
+            # ASCII only: a non-ASCII character here raises UnicodeEncodeError on a
+            # console using a legacy codepage (cp1251 et al), which fails the whole
+            # save request with a 500 and blocks switching away from the note.
+            print(f'[hist] PATCH {name!r} act=changed session_end=True -> history_written=True')
             _append_history(fp, 'changed', 'myNote')
             _last_history_content[real_fp] = content
         else:
-            print(f'[hist] PATCH {name!r} session_end=True changed=False → history_written=False')
+            print(f'[hist] PATCH {name!r} session_end=True changed=False -> history_written=False')
     return jsonify({'ok': True})
 
 
@@ -548,6 +714,11 @@ def api_trash_note(name):
     fp   = _safe_path(name)
     if not os.path.isfile(fp):
         abort(404)
+    # The placeholder note is a fixture the phone reuses, not a document. Trashing
+    # it hides the note the phone opens into, and emptying the Trash afterwards
+    # records it as deleted, which stops every device accepting it again.
+    if _is_placeholder_note(os.path.splitext(os.path.basename(fp))[0]):
+        return jsonify({'ok': False, 'error': 'placeholder note cannot be trashed'}), 409
     tags = _read_frontmatter(fp).get('tags', [])
     if TRASH_TAG not in tags:
         tags.append(TRASH_TAG)
@@ -997,8 +1168,9 @@ _SHARE_JS_AFTER = r"""
 
 
 def _build_share_html(title_esc, created, modified, tags_html,
-                      skipped_html, marked_js, md_json, attach_map_json):
-    """Assemble a self-contained shareable HTML string."""
+                      skipped_html, body_html):
+    """Assemble a self-contained shareable HTML string.
+    body_html is pre-rendered HTML — no JavaScript needed to display content."""
     return (
         '<!DOCTYPE html>\n'
         '<html lang="en">\n'
@@ -1019,15 +1191,11 @@ def _build_share_html(title_esc, created, modified, tags_html,
         '    ' + tags_html + '\n'
         '  </header>\n'
         + ('  ' + skipped_html + '\n' if skipped_html else '') +
-        '  <div class="note-body" id="note-body"></div>\n'
+        '  <div class="note-body" id="note-body">\n'
+        + body_html +
+        '\n  </div>\n'
         '</div>\n'
         '<footer class="note-footer">Shared with <strong>myNote</strong></footer>\n'
-        '<script>' + marked_js + '</script>\n'
-        '<script>\n'
-        + _SHARE_JS_BEFORE + md_json
-        + _SHARE_JS_MIDDLE + attach_map_json
-        + _SHARE_JS_AFTER
-        + '</script>\n'
         '</body>\n'
         '</html>\n'
     )
@@ -1128,22 +1296,51 @@ def api_share():
             '<ul>' + items + '</ul></div>'
         )
 
-    # Load embedded marked.js
-    marked_path = os.path.join(paths.STATIC_DIR, 'js', 'marked.min.js')
-    with open(marked_path, 'r', encoding='utf-8') as f:
-        marked_js = f.read()
+    # Render markdown to HTML server-side so content displays on any viewer
+    # (mobile share-sheet viewers and Quick Look don't execute JavaScript).
+    import markdown as _md_pkg
+    body_html = _md_pkg.markdown(
+        body_processed,
+        extensions=['fenced_code', 'tables', 'nl2br'],
+    )
 
-    md_json         = _json.dumps(body_processed)
-    attach_map_json = _json.dumps(data_map)
+    # Substitute /attachments/... paths with embedded data URIs
+    def _sub_attach(m):
+        attr = m.group(1)
+        url  = m.group(2)
+        uri  = data_map.get(url) or data_map.get(_urlparse.unquote(url))
+        return (attr + '="' + uri + '"') if uri else m.group(0)
+
+    body_html = re.sub(r'(src|href)="(/attachments/[^"]*)"', _sub_attach, body_html)
+
+    # Upgrade data-URI <a> links to inline <video>/<audio> players
+    def _upgrade_media(m):
+        href, text = m.group(1), m.group(2)
+        if href.startswith('data:video/'):
+            return (
+                '<div class="note-media-wrap">'
+                '<video class="note-media-video" src="' + href + '" controls preload="metadata"></video>'
+                '<div class="note-media-label">' + text + '</div>'
+                '</div>'
+            )
+        if href.startswith('data:audio/'):
+            return (
+                '<div class="note-media-wrap note-media-wrap--audio">'
+                '<div class="note-media-label">' + text + '</div>'
+                '<audio class="note-media-audio" src="' + href + '" controls preload="metadata"></audio>'
+                '</div>'
+            )
+        return m.group(0)
+
+    body_html = re.sub(r'<a href="(data:[^"]+)">([^<]*)</a>', _upgrade_media, body_html)
+
     html_out = _build_share_html(
-        title_esc      = title_esc,
-        created        = _fmt(stat.st_ctime),
-        modified       = _fmt(stat.st_mtime),
-        tags_html      = tags_html,
-        skipped_html   = skipped_html,
-        marked_js      = marked_js,
-        md_json        = md_json,
-        attach_map_json= attach_map_json,
+        title_esc  = title_esc,
+        created    = _fmt(stat.st_ctime),
+        modified   = _fmt(stat.st_mtime),
+        tags_html  = tags_html,
+        skipped_html = skipped_html,
+        body_html  = body_html,
     )
 
     # Save to ~/Downloads
@@ -1315,8 +1512,16 @@ def api_rename_note(name):
         abort(400)
     notes_dir = paths.get_notes_dir()
     base      = os.path.realpath(notes_dir)
-    # Auto-increment name if the target filename already exists (and isn't the same file)
-    new_name, new_fp = _unique_note_path(new_name, notes_dir, exclude_fp=fp)
+    # Naming the scratch note graduates it into a real note: it takes the same
+    # Title_XXXXXXXX shape as one made with the New button, and no_name.md is
+    # freed afterwards so there is always somewhere to start typing.
+    graduating = _is_placeholder_note(os.path.splitext(os.path.basename(fp))[0])
+    if graduating:
+        new_name = _unique_suffixed_name(new_name, notes_dir)
+        new_fp   = os.path.join(notes_dir, new_name + '.md')
+    else:
+        # Auto-increment name if the target filename already exists (and isn't the same file)
+        new_name, new_fp = _unique_note_path(new_name, notes_dir, exclude_fp=fp)
     if not new_fp.startswith(base + os.sep):
         abort(403)
     if os.path.realpath(new_fp) != os.path.realpath(fp):
@@ -1328,7 +1533,9 @@ def api_rename_note(name):
         # Keep _last_history_content key in sync with the new path.
         if old_real in _last_history_content:
             _last_history_content[os.path.realpath(new_fp)] = _last_history_content.pop(old_real)
-    return jsonify({'name': new_name})
+        if graduating:
+            _ensure_placeholder_note(notes_dir)
+    return jsonify({'name': new_name, 'graduated': graduating})
 
 
 @app.route('/attachments/<path:filename>')
@@ -1457,6 +1664,20 @@ def _sse_notify(msg: str, level: str = 'warn') -> None:
     _startup_notify['data'] = data
     _startup_notify['at']   = time.time()
     _sse_broadcast(data)   # also push to any already-open tabs
+
+def _sse_auto_sync(source: str, phase: str, ok: bool = None, error: str = None,
+                   to_remote: int = 0, to_local: int = 0) -> None:
+    """Notify open tabs that a cron-triggered (background) sync started/ended,
+    so the UI can spin the sync icon for syncs it didn't initiate itself."""
+    payload = {'type': 'auto_sync', 'source': source, 'phase': phase}
+    if ok is not None:
+        payload['ok'] = ok
+    if error is not None:
+        payload['error'] = error
+    if phase == 'end':
+        payload['toRemote'] = to_remote
+        payload['toLocal']  = to_local
+    _sse_broadcast(_json.dumps(payload))
 _tg_log.setLevel(logging.DEBUG)
 if not _tg_log.handlers:
     _h = logging.StreamHandler()
@@ -2037,13 +2258,17 @@ def _telegram_user_poll_loop() -> None:
                 await client.disconnect()
                 _tg_log.debug('Disconnected')
 
+        _sse_auto_sync('telegram', 'start')
         loop = asyncio.new_event_loop()
+        _tg_poll_ok, _tg_poll_err = True, None
         try:
             loop.run_until_complete(_poll())
         except Exception as e:
             _tg_log.error('Poll loop error: %s', e, exc_info=True)
+            _tg_poll_ok, _tg_poll_err = False, str(e)
         finally:
             loop.close()
+        _sse_auto_sync('telegram', 'end', ok=_tg_poll_ok, error=_tg_poll_err)
 
         poll_interval = int(paths._load_config().get('telegram', {}).get('poll_interval', 30))
         _tg_log.debug('Next poll in %d s (or on settings change)', poll_interval)
@@ -2437,6 +2662,140 @@ def _sync_notes_by_id(local_dir: str, remote_dir: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Android SAF stray-file cleanup
+# ---------------------------------------------------------------------------
+
+# Extensions that a legitimate attachment would never have as its FINAL
+# extension — if a file ends in .txt but the part before .txt has one of
+# these, it's a SAF-generated stray copy (e.g. photo.jpg.txt, note.md.txt).
+_SAF_STRAY_INNER_EXTS = {
+    '.md', '.json',
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.svg',
+    '.mp4', '.mov', '.avi', '.mkv', '.webm',
+    '.mp3', '.m4a', '.ogg', '.wav', '.flac', '.aac',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.zip', '.rar', '.7z', '.tar', '.gz',
+}
+
+
+def _cleanup_android_txt_strays(remote_notes: str, remote_attach: str, log) -> int:
+    """Delete *.txt files that Android SAF created by appending .txt to real
+    filenames (text/plain MIME bug).  Safe to run before every sync.
+
+    Notes folder: every .txt is a stray (no legitimate .txt lives there).
+    Attachments tree: only .txt whose inner extension is a known non-text type
+    (e.g. photo.jpg.txt → stray; readme.txt → kept).
+    Returns number of files removed."""
+    removed = 0
+
+    # Notes folder (non-recursive — flat layout)
+    if os.path.isdir(remote_notes):
+        for entry in os.scandir(remote_notes):
+            if entry.is_file(follow_symlinks=False) and entry.name.lower().endswith('.txt'):
+                try:
+                    os.remove(entry.path)
+                    log.info('SAF cleanup: removed stray notes file %s', entry.name)
+                    removed += 1
+                except OSError as exc:
+                    log.warning('SAF cleanup: could not remove %s: %s', entry.name, exc)
+
+    # Attachments tree (recursive)
+    if os.path.isdir(remote_attach):
+        for dirpath, _dirs, filenames in os.walk(remote_attach):
+            for fname in filenames:
+                if not fname.lower().endswith('.txt'):
+                    continue
+                inner_ext = os.path.splitext(fname[:-4])[1].lower()  # ext before .txt
+                if inner_ext in _SAF_STRAY_INNER_EXTS:
+                    fp = os.path.join(dirpath, fname)
+                    try:
+                        os.remove(fp)
+                        log.info('SAF cleanup: removed stray attachment %s', fname)
+                        removed += 1
+                    except OSError as exc:
+                        log.warning('SAF cleanup: could not remove %s: %s', fname, exc)
+
+    if removed:
+        log.info('SAF cleanup: removed %d stray file(s) total', removed)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Orphan attachment cleanup
+# ---------------------------------------------------------------------------
+
+# Matches the URL part of every attachment link in a note:
+#   /attachments/<subfolder>/<filename>
+# Filename may be URL-encoded (spaces → %20, Cyrillic → %XX…).
+_ATTACH_LINK_RE = re.compile(r'\(/attachments/([^/)\n]+)/([^)\n]+)\)')
+
+
+def _orphan_attachment_cleanup(notes_dir: str, attach_dir: str, log) -> int:
+    """Delete attachment files that are not referenced by any note.
+
+    An orphan is a file in the attachments tree whose path never appears in
+    any .md file (including trashed notes — those still exist on disk).
+    Orphaned files are removed locally and logged to .deletions.json so the
+    deletion propagates to every other device on the next sync.
+
+    Returns the number of files removed."""
+    if not os.path.isdir(attach_dir):
+        return 0
+
+    # ── Step 1: collect every attachment path referenced by any note ─────────
+    referenced: 'set[str]' = set()
+    try:
+        note_entries = list(os.scandir(notes_dir))
+    except OSError:
+        return 0
+
+    for entry in note_entries:
+        if not entry.is_file(follow_symlinks=False) or not entry.name.endswith('.md'):
+            continue
+        try:
+            with open(entry.path, 'r', encoding='utf-8', errors='replace') as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        for m in _ATTACH_LINK_RE.finditer(content):
+            subfolder = m.group(1)
+            filename  = _urlparse.unquote(m.group(2))  # decode %20, %D0%91…
+            referenced.add(f'{subfolder}/{filename}')
+
+    # ── Step 2: walk the attachment tree and identify orphans ─────────────────
+    orphans: 'list[tuple[str, str]]' = []   # (rel_path, abs_path)
+    for dirpath, _dirs, filenames in os.walk(attach_dir):
+        for fname in filenames:
+            fp  = os.path.join(dirpath, fname)
+            rel = os.path.relpath(fp, attach_dir).replace('\\', '/')
+            if rel not in referenced:
+                orphans.append((rel, fp))
+
+    if not orphans:
+        return 0
+
+    # ── Step 3: delete orphans and log each one ───────────────────────────────
+    now          = time.time()
+    new_entries: list = []
+    removed      = 0
+    for rel, fp in orphans:
+        try:
+            os.remove(fp)
+            new_entries.append({'path': rel, 'type': 'attachment', 'deleted_at': now})
+            log.info('Orphan cleanup: removed %s', rel)
+            removed += 1
+        except OSError as exc:
+            log.warning('Orphan cleanup: could not remove %s: %s', rel, exc)
+
+    if new_entries:
+        _log_deletions(new_entries)
+
+    if removed:
+        log.info('Orphan cleanup: %d orphaned attachment(s) removed', removed)
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Attachment safety + deletion log
 # ---------------------------------------------------------------------------
 
@@ -2454,10 +2813,13 @@ def _load_deletion_log(log_path: str) -> dict:
         with open(log_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, list):                      # legacy format
-            return {'settings': {}, 'deletions': data}
+            return {'settings': {}, 'deletions': _strip_placeholder_deletions(data)}
+        raw = data.get('deletions', [])
         return {
             'settings':  data.get('settings', {}),
-            'deletions': data.get('deletions', []) if isinstance(data.get('deletions'), list) else [],
+            # Filtered on read too, so an entry arriving in another device's log
+            # is never acted on even before it gets written back out
+            'deletions': _strip_placeholder_deletions(raw) if isinstance(raw, list) else [],
         }
     except (OSError, json.JSONDecodeError):
         return {'settings': {}, 'deletions': []}
@@ -2499,6 +2861,10 @@ def _files_differ(p1: str, p2: str) -> bool:
 
 
 def _save_deletion_log(log_path: str, data: dict) -> None:
+    # Single choke point for every deletion-log write (local and remote), so the
+    # placeholder guard here covers trash-emptying, orphan cleanup and merges alike.
+    data = dict(data)
+    data['deletions'] = _strip_placeholder_deletions(data.get('deletions', []))
     # Write via temp + atomic replace so iCloud/GDrive file locks don't block us.
     tmp = log_path + '.tmp'
     try:
@@ -2521,6 +2887,17 @@ def _log_deletions(new_entries: list) -> None:
         by_path[e['path']] = e
     log_data['deletions'] = list(by_path.values())
     _save_deletion_log(log_path, log_data)
+
+
+def _unlog_deletion(fname: str) -> None:
+    """Remove a note filename from the deletion log (called when a note is
+    (re-)created so sync doesn't mistake it for a deleted ghost)."""
+    log_path = _deletion_log_path()
+    log_data = _load_deletion_log(log_path)
+    before = len(log_data['deletions'])
+    log_data['deletions'] = [e for e in log_data['deletions'] if e.get('path') != fname]
+    if len(log_data['deletions']) != before:
+        _save_deletion_log(log_path, log_data)
 
 
 def _get_note_attachments(note_path: str) -> list:
@@ -2609,10 +2986,13 @@ def _apply_deletion_log(notes_dir: str, attach_dir: str,
                 # File was modified/created after the deletion — resurrection wins
                 resurrected.add(e['path'])
                 continue
-            try:
-                os.remove(fp)
-            except OSError:
-                pass
+            if e['type'] == 'attachment' and not _is_attachment_safe_to_delete(e['path'], ''):
+                pass  # referenced by a local note — skip deletion
+            else:
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
         if e['type'] == 'note':
             hist_fp = _history_path(fp)
             if os.path.isfile(hist_fp):
@@ -2768,6 +3148,89 @@ _folder_wait_since: dict  = {}             # 'icloud' | 'gdrive' → float ts
 # or missed "editing done" call never blocks sync permanently.
 _editing_until: float = 0.0
 _EDITING_GRACE = 30.0   # seconds to hold the pause after each heartbeat
+
+# ── Placeholder note: sync without waiting for the editor to close ──────────
+# Anything typed into the scratch note is worth getting off this machine even
+# while it is still open, because the note is never deliberately "finished" —
+# the user types a thought and walks away. Editing normally pauses sync, so for
+# this note that pause is lifted and a deadline is armed instead.
+#
+# The deadline is armed ONCE, when content first appears, and is deliberately
+# not pushed back by further typing: an idle-reset timer would never fire for
+# someone who keeps adding a line every couple of minutes.  Whichever arrives
+# first — this deadline or the configured sync interval — carries the content.
+_PLACEHOLDER_SYNC_DELAY = 180.0   # 3 minutes
+_placeholder_due: float = 0.0     # when to force a sync; 0 = nothing pending
+
+
+def _placeholder_mark_dirty() -> None:
+    """Arm the forced-sync deadline the first time real content shows up."""
+    global _placeholder_due
+    if _placeholder_due == 0.0:
+        _placeholder_due = time.time() + _PLACEHOLDER_SYNC_DELAY
+        # Wake the sync loops. Each computed its sleep when it last went idle,
+        # so a loop parked on a 30-minute interval would otherwise sleep right
+        # through a deadline armed a moment later. They re-check whether
+        # anything is actually due before syncing, so this only makes them
+        # recompute the wait — it does not force a sync now.
+        for _ev_name in ('_github_wake', '_icloud_wake', '_gdrive_wake'):
+            _ev = globals().get(_ev_name)
+            if _ev is not None:
+                _ev.set()
+
+
+def _placeholder_clear() -> None:
+    global _placeholder_due
+    _placeholder_due = 0.0
+
+
+def _placeholder_rearm() -> None:
+    """Push the deadline out after a failed attempt, so a provider that stays
+    unreachable is retried on the same cadence instead of spun on every pass."""
+    global _placeholder_due
+    if _placeholder_due != 0.0:
+        _placeholder_due = time.time() + _PLACEHOLDER_SYNC_DELAY
+
+
+def _placeholder_settle(forced: bool, ok: bool) -> None:
+    """Resolve the pending deadline after a sync pass that was carrying it."""
+    if not forced:
+        return
+    _placeholder_clear() if ok else _placeholder_rearm()
+
+
+def _placeholder_sync_pending() -> bool:
+    """True while the scratch note holds content that has not synced yet."""
+    return _placeholder_due != 0.0
+
+
+def _placeholder_due_now() -> bool:
+    """True once the forced-sync deadline has actually fallen due."""
+    return _placeholder_due != 0.0 and time.time() >= _placeholder_due
+
+
+def _sync_paused_for_editing() -> bool:
+    """Whether the editing pause applies right now.
+
+    It does not when the scratch note has content waiting — that content has to
+    go out on schedule regardless of the editor still being open."""
+    if _placeholder_sync_pending():
+        return False
+    return time.time() < _editing_until
+
+
+def _sync_wait_timeout(interval: float, last_sync_mono: float = 0.0) -> float:
+    """How long a sync loop should sleep: whatever is left of the interval,
+    shortened so the loop wakes exactly when the placeholder deadline falls due.
+
+    last_sync_mono stops a re-computed sleep from restarting the whole interval
+    every time the loop is woken early."""
+    remaining = float(interval)
+    if last_sync_mono:
+        remaining = interval - (time.monotonic() - last_sync_mono)
+    if _placeholder_sync_pending():
+        remaining = min(remaining, _placeholder_due - time.time())
+    return max(1.0, remaining)
 
 
 def _detect_icloud_drive() -> 'str | None':
@@ -3000,6 +3463,9 @@ def _icloud_do_sync() -> dict:
     # Notes live directly in remote_root (same flat layout as local)
     remote_notes  = remote_root
 
+    # One-time sweep: delete stray *.txt files Android SAF deposited
+    _cleanup_android_txt_strays(remote_notes, remote_attach, _icloud_log)
+
     try:
         with _icloud_sync_lock:
             _sync_deletion_log(local_notes, remote_notes, local_attach, remote_attach)
@@ -3030,6 +3496,7 @@ def _icloud_do_sync() -> dict:
         c.setdefault('icloud', {})['last_sync'] = now
         paths._save_config(c)
 
+        _orphan_attachment_cleanup(local_notes, local_attach, _icloud_log)
         _sse_broadcast(json.dumps({'type': 'icloud_sync', 'result': total}))
         return {'ok': True, 'lastSync': now, **total}
     except Exception as e:
@@ -3040,20 +3507,33 @@ def _icloud_do_sync() -> dict:
 def _icloud_loop() -> None:
     """Background auto-sync thread."""
     _icloud_log.info('iCloud sync thread started')
+    last_sync_mono = 0.0
     while True:
         cfg      = paths._load_config().get('icloud', {})
         enabled  = cfg.get('enabled', False)
         interval = int(cfg.get('sync_interval', 300))
         if enabled and cfg.get('connected', False):
-            if time.time() < _editing_until:
+            if _sync_paused_for_editing():
                 _icloud_log.debug('Sync skipped — note is being edited')
                 _icloud_wake.clear()
                 _icloud_wake.wait(timeout=min(_EDITING_GRACE, interval))
                 continue
+            interval_due = (last_sync_mono == 0.0
+                            or time.monotonic() - last_sync_mono >= interval)
+            if not interval_due and not _placeholder_due_now():
+                _icloud_wake.clear()
+                _icloud_wake.wait(timeout=_sync_wait_timeout(interval, last_sync_mono))
+                continue
+            _forced = _placeholder_sync_pending()
             _icloud_log.debug('Auto-sync starting …')
-            _icloud_do_sync()
+            _sse_auto_sync('icloud', 'start')
+            result = _icloud_do_sync()
+            _sse_auto_sync('icloud', 'end', ok=result.get('ok', False), error=result.get('error'),
+                           to_remote=result.get('toRemote', 0), to_local=result.get('toLocal', 0))
+            _placeholder_settle(_forced, bool(result.get('ok')))
+            last_sync_mono = time.monotonic()
         _icloud_wake.clear()
-        _icloud_wake.wait(timeout=interval)
+        _icloud_wake.wait(timeout=_sync_wait_timeout(interval, last_sync_mono))
 
 
 _icloud_thread = threading.Thread(target=_icloud_loop,
@@ -3117,6 +3597,68 @@ def get_icloud():
 def icloud_detect():
     path = _detect_icloud_drive()
     return jsonify({'found': path is not None, 'path': path or ''})
+
+
+def _looks_like_mynotes(path: str) -> bool:
+    """A directory is treated as an existing myNotes sync folder if it contains a
+    notes/ or attachments/ subfolder, or any .md file directly inside it."""
+    try:
+        if os.path.isdir(os.path.join(path, 'notes')) or os.path.isdir(os.path.join(path, 'attachments')):
+            return True
+        for name in os.listdir(path):
+            if name.endswith('.md'):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _find_existing_mynotes(root: str, folder_name: str, max_depth: int = 4) -> 'str | None':
+    """Recursively search a drive for an existing sync folder named *folder_name*
+    (within folders and subfolders, up to *max_depth* levels). Returns the full path
+    of the best match, or None. A direct hit at root/folder_name is preferred; otherwise
+    a match validated by _looks_like_mynotes wins over a same-named-but-empty folder."""
+    if not root or not os.path.isdir(root):
+        return None
+
+    # Fast path: the conventional location directly under the drive root.
+    direct = os.path.join(root, folder_name)
+    if os.path.isdir(direct):
+        return direct
+
+    fallback_match = None
+    target = folder_name.lower()
+    root_depth = root.rstrip('\\/').count(os.sep)
+    for cur, dirs, _files in os.walk(root):
+        # Bound the search depth and skip hidden/system folders to stay fast on large drives.
+        depth = cur.rstrip('\\/').count(os.sep) - root_depth
+        if depth >= max_depth:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if not d.startswith('.') and not d.startswith('$')]
+        for d in dirs:
+            if d.lower() == target:
+                hit = os.path.join(cur, d)
+                if _looks_like_mynotes(hit):
+                    return hit
+                if fallback_match is None:
+                    fallback_match = hit
+    return fallback_match
+
+
+@app.route('/api/icloud/check-folder', methods=['GET'])
+def icloud_check_folder():
+    """Recursively search the drive for an existing myNotes sync folder so the setup
+    wizard can skip the create-folder step and use the found one. Falls back to
+    suggesting creation only when nothing is found anywhere on the drive."""
+    drive  = request.args.get('drivePath', '').strip()
+    folder = request.args.get('folder', 'myNotes').strip() or 'myNotes'
+    found  = _find_existing_mynotes(drive, folder)
+    if found:
+        return jsonify({'exists': True, 'path': found,
+                        'drivePath': os.path.dirname(found),
+                        'folder': os.path.basename(found)})
+    return jsonify({'exists': False, 'path': os.path.join(drive, folder)})
 
 
 @app.route('/api/icloud/setup', methods=['POST'])
@@ -3307,6 +3849,9 @@ def _gdrive_do_sync() -> dict:
     # Notes live directly in remote_root (same flat layout as local)
     remote_notes  = remote_root
 
+    # One-time sweep: delete stray *.txt files Android SAF deposited
+    _cleanup_android_txt_strays(remote_notes, remote_attach, _gdrive_log)
+
     try:
         with _gdrive_sync_lock:
             _sync_deletion_log(local_notes, remote_notes, local_attach, remote_attach)
@@ -3334,6 +3879,7 @@ def _gdrive_do_sync() -> dict:
         c.setdefault('gdrive', {})['last_sync'] = now
         paths._save_config(c)
 
+        _orphan_attachment_cleanup(local_notes, local_attach, _gdrive_log)
         _sse_broadcast(json.dumps({'type': 'gdrive_sync', 'result': total}))
         return {'ok': True, 'lastSync': now, **total}
     except Exception as e:
@@ -3344,20 +3890,37 @@ def _gdrive_do_sync() -> dict:
 def _gdrive_loop() -> None:
     """Background auto-sync thread."""
     _gdrive_log.info('Google Drive sync thread started')
+    _last_sync_mono = 0.0
     while True:
         cfg      = paths._load_config().get('gdrive', {})
         enabled  = cfg.get('enabled', False)
         interval = int(cfg.get('sync_interval', 300))
         if enabled and cfg.get('connected', False):
-            if time.time() < _editing_until:
+            now_mono = time.monotonic()
+            elapsed  = now_mono - _last_sync_mono
+            # A placeholder deadline that has come due is a real wake-up, not a
+            # spurious one, so it is allowed through the too-soon guard below.
+            if (_last_sync_mono and elapsed < max(interval - 5, interval * 0.9)
+                    and not _placeholder_due_now()):
+                # Woken too soon after the last sync — skip this spurious wake-up.
+                _gdrive_wake.clear()
+                _gdrive_wake.wait(timeout=max(interval - elapsed, 5))
+                continue
+            if _sync_paused_for_editing():
                 _gdrive_log.debug('Sync skipped — note is being edited')
                 _gdrive_wake.clear()
                 _gdrive_wake.wait(timeout=min(_EDITING_GRACE, interval))
                 continue
+            _forced = _placeholder_sync_pending()
             _gdrive_log.debug('Auto-sync starting …')
-            _gdrive_do_sync()
+            _sse_auto_sync('gdrive', 'start')
+            result = _gdrive_do_sync()
+            _sse_auto_sync('gdrive', 'end', ok=result.get('ok', False), error=result.get('error'),
+                           to_remote=result.get('toRemote', 0), to_local=result.get('toLocal', 0))
+            _placeholder_settle(_forced, bool(result.get('ok')))
+            _last_sync_mono = time.monotonic()
         _gdrive_wake.clear()
-        _gdrive_wake.wait(timeout=interval)
+        _gdrive_wake.wait(timeout=_sync_wait_timeout(interval, _last_sync_mono))
 
 
 _gdrive_thread = threading.Thread(target=_gdrive_loop,
@@ -3387,6 +3950,21 @@ def get_gdrive():
 def gdrive_detect():
     path = _detect_google_drive()
     return jsonify({'found': path is not None, 'path': path or ''})
+
+
+@app.route('/api/gdrive/check-folder', methods=['GET'])
+def gdrive_check_folder():
+    """Recursively search the drive for an existing myNotes sync folder so the setup
+    wizard can skip the create-folder step and use the found one. Falls back to
+    suggesting creation only when nothing is found anywhere on the drive."""
+    drive  = request.args.get('drivePath', '').strip()
+    folder = request.args.get('folder', 'myNotes').strip() or 'myNotes'
+    found  = _find_existing_mynotes(drive, folder)
+    if found:
+        return jsonify({'exists': True, 'path': found,
+                        'drivePath': os.path.dirname(found),
+                        'folder': os.path.basename(found)})
+    return jsonify({'exists': False, 'path': os.path.join(drive, folder)})
 
 
 @app.route('/api/gdrive/setup', methods=['POST'])
@@ -3462,6 +4040,1009 @@ def gdrive_disconnect():
     c['enabled']   = False
     paths._save_config(cfg)
     _gdrive_log.info('Google Drive disconnected by user')
+    return jsonify({'ok': True})
+
+
+# ---------------------------------------------------------------------------
+# GitHub sync
+# ---------------------------------------------------------------------------
+
+_github_wake      = threading.Event()
+_github_sync_lock = threading.Lock()
+_github_log       = logging.getLogger('[GitHub]')
+_github_log.setLevel(logging.DEBUG)
+if not _github_log.handlers:
+    try:
+        os.makedirs(paths.APPDATA_DIR, exist_ok=True)
+        _gh_log_file = os.path.join(paths.APPDATA_DIR, 'github_sync.log')
+        _gh_fh = logging.FileHandler(_gh_log_file, encoding='utf-8')
+        _gh_fh.setFormatter(logging.Formatter('%(asctime)s %(name)s %(message)s'))
+        _github_log.addHandler(_gh_fh)
+        print(f'[GitHub] log file: {_gh_log_file}', flush=True)
+    except Exception as _e:
+        print(f'[GitHub] WARNING: could not create log file: {_e}', flush=True)
+    _gh_sh = logging.StreamHandler()
+    _gh_sh.setFormatter(logging.Formatter('%(name)s %(message)s'))
+    _github_log.addHandler(_gh_sh)
+
+_GITHUB_STATE_FILE = os.path.join(paths.APPDATA_DIR, 'github_state.json')
+_GITHUB_PAT_FILE   = os.path.join(paths.APPDATA_DIR, 'github_pat.bin')
+
+
+def _gh_cfg() -> dict:
+    return paths._load_config().get('github', {})
+
+
+def _save_gh_pat(pat: str) -> None:
+    """Encrypt the PAT with DPAPI and store it in a separate binary file."""
+    os.makedirs(paths.APPDATA_DIR, exist_ok=True)
+    with open(_GITHUB_PAT_FILE, 'wb') as f:
+        f.write(_dpapi_encrypt(pat.encode('utf-8')))
+
+
+def _gh_pat() -> str:
+    """Load and decrypt the PAT from the DPAPI-protected file."""
+    try:
+        with open(_GITHUB_PAT_FILE, 'rb') as f:
+            return _dpapi_decrypt(f.read()).decode('utf-8')
+    except Exception:
+        return ''
+
+
+def _gh_api_base(repo_url: str) -> str:
+    """https://github.com/owner/repo.git → https://api.github.com/repos/owner/repo"""
+    url = repo_url.strip().rstrip('/')
+    if url.endswith('.git'):
+        url = url[:-4]
+    parts = url.split('github.com/', 1)
+    if len(parts) != 2 or not parts[1]:
+        raise ValueError(f'Cannot parse GitHub URL: {repo_url}')
+    return f'https://api.github.com/repos/{parts[1].rstrip("/")}'
+
+
+def _gh_request(method: str, url: str, pat: str, json_body=None, timeout: int = 30) -> dict:
+    headers = {
+        'Authorization': f'Bearer {pat}',
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'myNote-sync/1.0',
+    }
+    resp = requests.request(method, url, headers=headers, json=json_body, timeout=timeout)
+    if not resp.ok:
+        msg = ''
+        try:
+            msg = resp.json().get('message', '')
+        except Exception:
+            pass
+        raise RuntimeError(f'GitHub {method}: HTTP {resp.status_code} {msg}')
+    return resp.json() if resp.content else {}
+
+
+def _git_blob_sha(data: bytes) -> str:
+    h = _hashlib.sha1()
+    h.update(f'blob {len(data)}\0'.encode())
+    h.update(data)
+    return h.hexdigest()
+
+
+_LARGE_FILE_THRESHOLD = 900 * 1024        # 900 KB — GitHub's Contents API caps uploads around 1MB
+_GIT_HARD_MAX         = 40 * 1024 * 1024  # GitHub's Git Data API rejected a 47MB blob in testing
+_GITHUB_TOO_LARGE_FILE = os.path.join(paths.APPDATA_DIR, 'github_too_large.json')
+
+_default_branch_cache: dict = {}
+
+
+def _load_too_large_set() -> set:
+    try:
+        with open(_GITHUB_TOO_LARGE_FILE, 'r', encoding='utf-8') as f:
+            return set(_json.load(f))
+    except (OSError, _json.JSONDecodeError):
+        return set()
+
+
+def _save_too_large_set(rels: set) -> None:
+    tmp = _GITHUB_TOO_LARGE_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        _json.dump(sorted(rels), f)
+    os.replace(tmp, _GITHUB_TOO_LARGE_FILE)
+
+
+def _mark_too_large(rel: str) -> None:
+    rels = _load_too_large_set()
+    rels.add(rel)
+    _save_too_large_set(rels)
+
+
+def _gh_default_branch(api_base: str, pat: str) -> str:
+    if api_base in _default_branch_cache:
+        return _default_branch_cache[api_base]
+    repo = _gh_request('GET', api_base, pat)
+    branch = repo.get('default_branch', 'main')
+    _default_branch_cache[api_base] = branch
+    return branch
+
+
+def _gh_data_push_file(api_base: str, pat: str, rel: str, raw: bytes) -> str:
+    """Pushes a large file (>=900KB) via the Git Data API instead of the Contents API, which
+    GitHub caps around 1MB. Creates a blob, grafts it into a new tree off the current commit,
+    commits it, and moves the branch ref forward — i.e. a manual single-file 'git push'."""
+    branch = _gh_default_branch(api_base, pat)
+    # Scale the timeout to payload size — a 30s default isn't enough for large video/audio
+    # uploads (base64 inflates size ~33%), especially over slower upstream connections.
+    upload_timeout = max(60, len(raw) // (256 * 1024))  # ~4s per 1MB, floor of 60s
+    blob = _gh_request('POST', f'{api_base}/git/blobs', pat, {
+        'content': base64.b64encode(raw).decode(), 'encoding': 'base64',
+    }, timeout=upload_timeout)
+    ref = _gh_request('GET', f'{api_base}/git/refs/heads/{branch}', pat)
+    parent_commit_sha = ref['object']['sha']
+    parent_commit = _gh_request('GET', f'{api_base}/git/commits/{parent_commit_sha}', pat)
+    new_tree = _gh_request('POST', f'{api_base}/git/trees', pat, {
+        'base_tree': parent_commit['tree']['sha'],
+        'tree': [{'path': rel, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']}],
+    })
+    new_commit = _gh_request('POST', f'{api_base}/git/commits', pat, {
+        'message': f'sync: add/update large file {rel}',
+        'tree': new_tree['sha'],
+        'parents': [parent_commit_sha],
+    })
+    _gh_request('PATCH', f'{api_base}/git/refs/heads/{branch}', pat, {'sha': new_commit['sha']})
+    return blob['sha']
+
+
+def _gh_load_state() -> dict:
+    try:
+        with open(_GITHUB_STATE_FILE, 'r', encoding='utf-8') as f:
+            return _json.load(f)
+    except (OSError, _json.JSONDecodeError):
+        return {}
+
+
+def _gh_save_state(state: dict) -> None:
+    tmp = _GITHUB_STATE_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        _json.dump(state, f)
+    os.replace(tmp, _GITHUB_STATE_FILE)
+
+
+def _gh_should_sync(rel: str) -> bool:
+    """Return True if this relative path belongs in the GitHub repo."""
+    parts = rel.split('/')
+    if any(p.startswith('.') for p in parts):
+        return False
+    fname = parts[-1]
+    if fname.endswith('.tmp'):
+        return False
+    if len(parts) == 1:
+        return fname.endswith('.md') or fname.endswith('.history.json')
+    if parts[0] == 'attachments' and len(parts) == 3:
+        return True
+    return False
+
+
+def _gh_file_commit_time(api_base: str, pat: str, rel: str) -> float:
+    """Return the UTC timestamp of the most recent GitHub commit that touched rel."""
+    try:
+        import urllib.parse as _up
+        from datetime import datetime, timezone as _tz
+        resp = _gh_request('GET',
+            f'{api_base}/commits?path={_up.quote(rel, safe="")}&per_page=1', pat)
+        if resp:
+            dt_str = resp[0]['commit']['committer']['date']
+            return datetime.strptime(dt_str, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=_tz.utc).timestamp()
+    except Exception:
+        pass
+    return 0.0
+
+
+def _gh_fetch_blob(api_base: str, pat: str, sha: str) -> bytes:
+    """Fetch raw blob content by git object SHA. Generous timeout since this is also used
+    for large attachment downloads (video/audio), not just small merge-base text fetches."""
+    resp = _gh_request('GET', f'{api_base}/git/blobs/{sha}', pat, timeout=120)
+    return base64.b64decode(resp.get('content', '').replace('\n', ''))
+
+
+def _gh_remote_entry_time(api_base: str, pat: str, rel: str,
+                          github_files: dict, gh_sha: str) -> float:
+    """When the remote copy of `rel` was entered, as epoch seconds.
+
+    Prefers the note's history sidecar in the repo, which both apps write at
+    edit time, and falls back to the file's commit time — that is when the other
+    device pushed rather than when the text was typed, but it still orders the
+    two sides correctly in the overwhelming majority of cases."""
+    hist_rel = re.sub(r'\.md$', '.history.json', rel)
+    if hist_rel in github_files:
+        try:
+            blob = _gh_fetch_blob(api_base, pat, github_files[hist_rel])
+            entries = _json.loads(blob.decode('utf-8', errors='replace'))
+            times = [t for t in (_history_ts(e) for e in entries) if t > 0]
+            if times:
+                return max(times)
+        except Exception:
+            pass
+    try:
+        return _gh_file_commit_time(api_base, pat, rel)
+    except Exception:
+        return 0.0
+
+
+def _removed_base_indices(base_lines: list, side_lines: list) -> set:
+    """Indices of base lines this side no longer has.
+
+    'replace' counts as removal of the old lines — the replacement itself comes
+    back through _added_blocks and is placed by timestamp like any other
+    addition."""
+    from difflib import SequenceMatcher
+    gone = set()
+    for tag, i1, i2, _j1, _j2 in SequenceMatcher(
+            None, base_lines, side_lines, autojunk=False).get_opcodes():
+        if tag in ('delete', 'replace'):
+            gone.update(range(i1, i2))
+    return gone
+
+
+def _added_blocks(base_lines: list, side_lines: list) -> list:
+    """Contiguous runs of lines present in `side` but not in `base`."""
+    from difflib import SequenceMatcher
+    blocks = []
+    for tag, _i1, _i2, j1, j2 in SequenceMatcher(
+            None, base_lines, side_lines, autojunk=False).get_opcodes():
+        if tag in ('insert', 'replace') and j2 > j1:
+            blocks.append(side_lines[j1:j2])
+    return blocks
+
+
+def _merge_by_timeline(base: str, local: str, remote: str,
+                       local_at: float, remote_at: float) -> str:
+    """Merge two concurrent versions by when their content was entered.
+
+    Shared text is kept once; whatever each side added on top is then stacked
+    oldest-first, one blank line between blocks.  So a phone note typed at 10:00
+    and a PC note typed at 11:00 come back in that order, and neither is lost.
+
+    Unlike a 3-way text merge this never rewrites a line in place, which is why
+    a paragraph reworded on one device arrives as a second copy rather than
+    replacing the first — the trade for never dropping anything.
+    """
+    if local == remote:
+        return local
+
+    b = base.splitlines()
+    l = local.splitlines()
+    r = remote.splitlines()
+
+    # Lines the base had that a side has since dropped. A deletion on either
+    # side applies: without this the merge could only ever grow a note, so a
+    # line removed on one device was restored from the base and pushed straight
+    # back to the device that deleted it.
+    removed   = _removed_base_indices(b, l) | _removed_base_indices(b, r)
+    surviving = [ln for i, ln in enumerate(b) if i not in removed]
+
+    sides = [
+        (local_at,  _added_blocks(b, l)),
+        (remote_at, _added_blocks(b, r)),
+    ]
+    # Oldest first. Ties keep local ahead of remote for a stable result.
+    sides.sort(key=lambda s: s[0])
+
+    out = list(surviving)
+    seen = {ln.strip() for ln in out if ln.strip()}
+    for _at, blocks in sides:
+        for block in blocks:
+            text = '\n'.join(block).strip('\n')
+            if not text.strip():
+                continue
+            # Skip a block already present — the same words typed on both
+            # devices, or a stale base making shared text look "added".
+            kept = [ln for ln in text.split('\n') if ln.strip() not in seen]
+            # Trim blank edges so the separator below is the only gap — a block
+            # can start or end blank once shared lines are filtered out of it.
+            while kept and not kept[0].strip():
+                kept.pop(0)
+            while kept and not kept[-1].strip():
+                kept.pop()
+            if not any(ln.strip() for ln in kept):
+                continue
+            if out and out[-1].strip():
+                out.append('')          # the one blank line between blocks
+            out.extend(kept)
+            seen.update(ln.strip() for ln in kept if ln.strip())
+
+    return '\n'.join(out).rstrip('\n') + '\n'
+
+
+def _extend_terminated(out: list, block: list) -> None:
+    """Append a block, ending it on a line boundary.
+
+    A conflict marker written after an unterminated line would otherwise be
+    glued to the end of that text — "...last words=======" — which no longer
+    reads as a marker at all.
+    """
+    if not block:
+        return
+    out.extend(block[:-1])
+    last = block[-1]
+    out.append(last if last.endswith('\n') else last + '\n')
+
+
+def _merge_texts(base: str, local: str, remote: str) -> 'tuple[str, bool]':
+    """
+    3-way line merge. Returns (merged_text, had_conflicts).
+    Non-overlapping changes from both sides are applied automatically.
+    Insertions at the same position are merged (remote order first, unique local appended).
+    Overlapping replacements/deletions get <<<< ==== >>>> conflict markers.
+    """
+    from difflib import SequenceMatcher
+
+    # Normalise line endings before diffing: the PC historically saved CRLF
+    # while the mobile app saves LF, making otherwise-identical lines compare
+    # as different and defeating both the diff and the insertion dedupe.
+    # Merged output is always LF.
+    #
+    # Also guarantee a trailing newline.  An editor saves exactly what was
+    # typed, so a note rarely ends with one — and then appending text *modifies*
+    # the last line instead of inserting after it.  Both sides end up replacing
+    # the same line, so two independent appends collide as a conflict rather
+    # than merging.  Terminating every side first makes an append a true
+    # insertion.
+    def _norm(s: str) -> str:
+        lf = s.replace('\r\n', '\n').replace('\r', '\n')
+        return lf + '\n' if lf and not lf.endswith('\n') else lf
+
+    b = _norm(base).splitlines(keepends=True)
+    l = _norm(local).splitlines(keepends=True)
+    r = _norm(remote).splitlines(keepends=True)
+
+    # Degenerate-base guard: when the base shares (almost) nothing with either
+    # side — e.g. stale prev_sha after a rename or repo wipe — both sides look
+    # like one giant insertion and the merge below would concatenate the two
+    # full documents into a doubled note.  Refuse to merge in that case and
+    # signal a conflict so the caller falls back to last-write-wins.
+    if b and l and r:
+        _b_set = {ln.rstrip() for ln in b if ln.strip()}
+        _l_set = {ln.rstrip() for ln in l if ln.strip()}
+        _r_set = {ln.rstrip() for ln in r if ln.strip()}
+        if _b_set and _l_set and _r_set:
+            _l_overlap = len(_b_set & _l_set) / len(_b_set | _l_set)
+            _r_overlap = len(_b_set & _r_set) / len(_b_set | _r_set)
+            if _l_overlap < 0.2 and _r_overlap < 0.2:
+                raise ValueError('merge base unrelated to both sides')
+    elif not b and (l and r):
+        raise ValueError('merge base is empty')
+
+    l_ch = [(i1, i2, j1, j2) for tag, i1, i2, j1, j2
+            in SequenceMatcher(None, b, l, autojunk=False).get_opcodes()
+            if tag != 'equal']
+    r_ch = [(i1, i2, j1, j2) for tag, i1, i2, j1, j2
+            in SequenceMatcher(None, b, r, autojunk=False).get_opcodes()
+            if tag != 'equal']
+
+    out = []
+    had_conflicts = False
+    pos = 0
+    li = ri = 0
+
+    while True:
+        # Skip fully-consumed changes
+        while li < len(l_ch) and l_ch[li][1] <= pos:
+            li += 1
+        while ri < len(r_ch) and r_ch[ri][1] <= pos:
+            ri += 1
+
+        next_l = l_ch[li][0] if li < len(l_ch) else None
+        next_r = r_ch[ri][0] if ri < len(r_ch) else None
+
+        if next_l is None and next_r is None:
+            out.extend(b[pos:])
+            break
+
+        next_ev = min(x for x in [next_l, next_r] if x is not None)
+
+        # Emit unchanged base lines up to the next event
+        if next_ev > pos:
+            out.extend(b[pos:next_ev])
+            pos = next_ev
+
+        l_here = l_ch[li] if li < len(l_ch) and l_ch[li][0] == pos else None
+        r_here = r_ch[ri] if ri < len(r_ch) and r_ch[ri][0] == pos else None
+
+        if l_here and r_here:
+            l_i1, l_i2, l_j1, l_j2 = l_here
+            r_i1, r_i2, r_j1, r_j2 = r_here
+            lc = l[l_j1:l_j2]
+            rc = r[r_j1:r_j2]
+
+            if lc == rc and l_i2 == r_i2:
+                # Both made the same change
+                out.extend(rc)
+                pos = l_i2
+                li += 1
+                ri += 1
+            elif l_i1 == l_i2 and r_i1 == r_i2:
+                # Both are pure insertions at the same spot — merge (remote first).
+                # Dedupe ignoring trailing whitespace so a CRLF/trailing-space
+                # variant of the same line doesn't get inserted twice.
+                merged_ins   = list(rc)
+                _stripped    = {ln.rstrip() for ln in rc}
+                for line in lc:
+                    if line.rstrip() not in _stripped:
+                        merged_ins.append(line)
+                        _stripped.add(line.rstrip())
+                out.extend(merged_ins)
+                # pos unchanged (insertions consume no base lines)
+                li += 1
+                ri += 1
+            else:
+                # Overlapping non-identical change → conflict markers
+                conflict_end = max(l_i2, r_i2)
+                had_conflicts = True
+                out.append('<<<<<<< local\n')
+                _extend_terminated(out, lc)
+                out.append('=======\n')
+                _extend_terminated(out, rc)
+                out.append('>>>>>>> github\n')
+                pos = conflict_end
+                # Advance past anything inside the conflict region
+                while li < len(l_ch) and l_ch[li][0] < conflict_end:
+                    li += 1
+                while ri < len(r_ch) and r_ch[ri][0] < conflict_end:
+                    ri += 1
+        elif l_here:
+            l_i1, l_i2, l_j1, l_j2 = l_here
+            out.extend(l[l_j1:l_j2])
+            pos = l_i2
+            li += 1
+        else:
+            r_i1, r_i2, r_j1, r_j2 = r_here
+            out.extend(r[r_j1:r_j2])
+            pos = r_i2
+            ri += 1
+
+    return ''.join(out), had_conflicts
+
+
+def _gh_sync_deletion_log(api_base: str, pat: str, notes_dir: str, attach_dir: str) -> None:
+    """Fetch .deletions.json from GitHub, union-merge with local, push merged,
+    then apply the merged deletions to the local notes/attachments tree.
+
+    .deletions.json is a dotfile excluded from the normal _gh_should_sync walk,
+    so it is handled explicitly here before the main file loop."""
+    local_log  = _deletion_log_path(notes_dir)
+    local_data = _load_deletion_log(local_log)
+    remote_sha: 'str | None' = None
+
+    # Try to fetch the remote copy
+    remote_data: dict = {'settings': {}, 'deletions': []}
+    try:
+        resp = _gh_request('GET', f'{api_base}/contents/.deletions.json', pat)
+        raw  = base64.b64decode(resp['content'].replace('\n', ''))
+        parsed = _json.loads(raw.decode('utf-8'))
+        if isinstance(parsed, list):
+            remote_data = {'settings': {}, 'deletions': parsed}
+        else:
+            remote_data = {
+                'settings':  parsed.get('settings', {}),
+                'deletions': parsed.get('deletions', [])
+                             if isinstance(parsed.get('deletions'), list) else [],
+            }
+        remote_sha = resp.get('sha')
+    except RuntimeError:
+        pass   # file absent on GitHub — will be created below
+    except Exception as exc:
+        _github_log.warning('Could not fetch .deletions.json from GitHub: %s', exc)
+        return
+
+    # Settings merge: latest lastchanged wins
+    l_cfg = local_data.get('settings', {})
+    r_cfg = remote_data.get('settings', {})
+    merged_settings = r_cfg if r_cfg.get('lastchanged', 0) > l_cfg.get('lastchanged', 0) else l_cfg
+
+    # Deletions merge: union, newest deleted_at per path; purge entries > 6 months
+    cutoff  = time.time() - 180 * 86400
+    by_path: dict = {}
+    for e in local_data['deletions'] + remote_data['deletions']:
+        p = e['path']
+        if e.get('deleted_at', 0) > cutoff:
+            if p not in by_path or e.get('deleted_at', 0) > by_path[p].get('deleted_at', 0):
+                by_path[p] = e
+
+    # The push below builds its own body rather than going through
+    # _save_deletion_log, so the placeholder guard has to be applied here too —
+    # this is what clears an existing entry out of the shared GitHub copy.
+    merged = {'settings': merged_settings,
+              'deletions': _strip_placeholder_deletions(list(by_path.values()))}
+
+    # Write merged log locally
+    _save_deletion_log(local_log, merged)
+
+    # Push merged log to GitHub
+    merged_bytes = _json.dumps(merged, ensure_ascii=False, indent=2).encode('utf-8')
+    body: dict = {
+        'message': 'sync: update .deletions.json',
+        'content': base64.b64encode(merged_bytes).decode(),
+    }
+    if remote_sha:
+        body['sha'] = remote_sha
+    try:
+        _gh_request('PUT', f'{api_base}/contents/.deletions.json', pat, body)
+        _github_log.debug('Pushed merged .deletions.json to GitHub')
+    except RuntimeError as exc:
+        _github_log.warning('Could not push .deletions.json: %s', exc)
+
+    # Apply merged deletions to local tree
+    _apply_deletion_log(notes_dir, attach_dir, local_log)
+
+
+def _gh_do_sync() -> dict:
+    print('[GitHub] SYNC DEBUG: _gh_do_sync() entered', flush=True)
+    _github_log.info('SYNC DEBUG: _gh_do_sync() entered')
+    cfg = _gh_cfg()
+    _github_log.info('SYNC DEBUG: cfg=%s', {k: v for k, v in cfg.items() if k != 'pat_b64'})
+    if not cfg.get('connected'):
+        _github_log.info('SYNC DEBUG: early return — not connected')
+        return {'ok': True, 'toRemote': 0, 'toLocal': 0, 'skipped': 0}
+
+    pat      = _gh_pat()
+    repo_url = cfg.get('repo_url', '')
+    _github_log.info('SYNC DEBUG: pat present=%s repo_url=%s', bool(pat), repo_url)
+    if not pat or not repo_url:
+        _github_log.info('SYNC DEBUG: early return — missing pat or repo_url')
+        return {'ok': False, 'error': 'Not configured'}
+
+    try:
+        api_base = _gh_api_base(repo_url)
+        _github_log.info('SYNC DEBUG: api_base=%s', api_base)
+    except ValueError as e:
+        _github_log.info('SYNC DEBUG: early return — api_base error: %s', e)
+        return {'ok': False, 'error': str(e)}
+
+    notes_dir   = paths.get_notes_dir()
+    attach_dir  = paths.get_attachments_dir()
+
+    # ── Deletion-log sync (must happen before the main file loop) ────────────
+    # .deletions.json is a dotfile so it is excluded from the normal sync walk.
+    # We handle it explicitly here: fetch remote, union-merge with local,
+    # push merged back, then apply the merged deletions to the local tree.
+    _gh_sync_deletion_log(api_base, pat, notes_dir, attach_dir)
+
+    # Fetch GitHub tree in a single API call
+    _github_log.info('SYNC DEBUG: fetching tree from %s', api_base)
+    try:
+        tree = _gh_request('GET', f'{api_base}/git/trees/HEAD?recursive=1', pat)
+        github_files = {
+            item['path']: item['sha']
+            for item in tree.get('tree', [])
+            if item['type'] == 'blob' and _gh_should_sync(item['path'])
+        }
+        github_file_sizes = {
+            item['path']: item.get('size', 0)
+            for item in tree.get('tree', [])
+            if item['type'] == 'blob' and _gh_should_sync(item['path'])
+        }
+        _github_log.info('SYNC DEBUG: tree fetched OK, %d syncable blobs', len(github_files))
+    except RuntimeError as e:
+        _github_log.info('SYNC DEBUG: tree fetch exception: %s', e)
+        if '404' in str(e) or '409' in str(e):
+            github_files = {}   # empty / uninitialised repo
+            github_file_sizes = {}
+        else:
+            _github_log.error('Tree fetch failed: %s', e)
+            return {'ok': False, 'error': str(e)}
+
+    # Walk local notes directory
+    local_files: dict = {}
+    for root, dirs, files in os.walk(notes_dir):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for fname in files:
+            if fname.startswith('.') or fname.endswith('.tmp'):
+                continue
+            fp  = os.path.join(root, fname)
+            rel = os.path.relpath(fp, notes_dir).replace('\\', '/')
+            if _gh_should_sync(rel):
+                local_files[rel] = fp
+
+    # Build a map of deletion-log rels → deleted_at for the resurrection guard.
+    # Files newer than their deletion timestamp were recreated and must be kept.
+    _del_log_data = _load_deletion_log(_deletion_log_path(notes_dir))
+    _deleted_info: dict = {}   # rel → deleted_at timestamp
+    for _e in _del_log_data['deletions']:
+        if _e['type'] == 'note':
+            _deleted_info[_e['path']] = _e.get('deleted_at', 0)
+        elif _e['type'] == 'attachment':
+            _deleted_info['attachments/' + _e['path'].replace('\\', '/')] = _e.get('deleted_at', 0)
+    for _rel, _del_at in list(_deleted_info.items()):
+        if _rel not in local_files:
+            continue
+        try:
+            _lmtime = os.path.getmtime(local_files[_rel])
+        except OSError:
+            _lmtime = 0
+        if _lmtime > _del_at:
+            # File was recreated after the deletion — resurrection wins, keep it
+            _github_log.debug('Resurrection: keeping %s (mtime %.0f > deleted_at %.0f)',
+                              _rel, _lmtime, _del_at)
+        else:
+            _is_attach_del = _rel.startswith('attachments/')
+            if _is_attach_del and not _is_attachment_safe_to_delete(_rel[len('attachments/'):], ''):
+                _github_log.debug('Skipping deletion of referenced attachment: %s', _rel)
+            else:
+                try:
+                    os.remove(local_files[_rel])
+                    _github_log.debug('Removed locally present deleted file: %s', _rel)
+                except OSError:
+                    pass
+                del local_files[_rel]
+
+    _deleted_rels: set = set(_deleted_info.keys())
+
+    # State: {rel: {"sha": last_synced_gh_sha, "at": sync_timestamp}}
+    # sha → detect if GitHub changed since last sync
+    # at  → detect if local file changed since last sync (via mtime)
+    raw_state: dict = _gh_load_state()
+    new_state: dict = {}
+    sync_now  = time.time()
+    to_remote = to_local = skipped = 0
+    too_large_set = _load_too_large_set()
+
+    _github_log.info('SYNC DEBUG: notes_dir=%s', notes_dir)
+    _github_log.info('SYNC DEBUG: github=%d local=%d state=%d',
+                     len(github_files), len(local_files), len(raw_state))
+
+    def _state_entry(rel: str) -> dict:
+        v = raw_state.get(rel)
+        if v is None:
+            return {'sha': None, 'at': 0}
+        if isinstance(v, str):          # old format migration
+            return {'sha': v, 'at': 0}
+        return v
+
+    def _push_file(rel: str, raw: bytes, local_sha: str, gh_sha: 'str | None') -> None:
+        nonlocal to_remote, skipped
+        if len(raw) >= _LARGE_FILE_THRESHOLD:
+            if len(raw) >= _GIT_HARD_MAX:
+                _github_log.info('SYNC DEBUG: SKIP %s — %d KB exceeds Git\'s hard size limit', rel, len(raw) // 1024)
+                skipped += 1
+                return
+            if rel in too_large_set:
+                _github_log.info('SYNC DEBUG: SKIP %s — previously confirmed too large for Git', rel)
+                skipped += 1
+                return
+            _github_log.info('SYNC DEBUG: PUSH %s (%d KB, via Git Data API)', rel, len(raw) // 1024)
+            try:
+                _gh_data_push_file(api_base, pat, rel, raw)
+                new_state[rel] = {'sha': local_sha, 'at': sync_now}
+                to_remote += 1
+            except RuntimeError as push_err:
+                _github_log.warning('Large file push failed for %s: %s', rel, push_err)
+                if 'too large' in str(push_err).lower():
+                    _mark_too_large(rel)
+                    too_large_set.add(rel)
+                skipped += 1
+            return
+        body: dict = {
+            'message': f'sync: {"update" if gh_sha else "add"} {rel}',
+            'content': base64.b64encode(raw).decode(),
+        }
+        if gh_sha:
+            body['sha'] = gh_sha
+        _github_log.info('SYNC DEBUG: PUSH %s', rel)
+        try:
+            _gh_request('PUT', f'{api_base}/contents/{_urlparse.quote(rel, safe="/")}', pat, body)
+            new_state[rel] = {'sha': local_sha, 'at': sync_now}
+            to_remote += 1
+        except RuntimeError as push_err:
+            if '409' in str(push_err):
+                _github_log.warning('Push blocked for %s: %s', rel, push_err)
+                _sse_broadcast(json.dumps({'type': 'notify',
+                    'msg': f'GitHub sync: skipped "{rel}" — push protection blocked it.',
+                    'level': 'warn'}))
+                skipped += 1
+            else:
+                raise
+
+    def _pull_file(rel: str, gh_sha: str) -> None:
+        nonlocal to_local
+        _github_log.info('SYNC DEBUG: PULL %s', rel)
+        if github_file_sizes.get(rel, 0) >= _LARGE_FILE_THRESHOLD:
+            _github_log.info('SYNC DEBUG: PULL %s (large, via Git Data API)', rel)
+            content = _gh_fetch_blob(api_base, pat, gh_sha)
+        else:
+            resp    = _gh_request('GET', f'{api_base}/contents/{_urlparse.quote(rel, safe="/")}', pat)
+            content = base64.b64decode(resp['content'].replace('\n', ''))
+        dest    = os.path.join(notes_dir, rel.replace('/', os.sep))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp     = dest + '.tmp'
+        with open(tmp, 'wb') as wf:
+            wf.write(content)
+        os.replace(tmp, dest)
+        new_state[rel] = {'sha': gh_sha, 'at': sync_now}
+        to_local += 1
+
+    for rel in set(github_files) | set(local_files):
+        in_local  = rel in local_files
+        in_github = rel in github_files
+
+        raw = local_sha = local_mtime = None
+        if in_local:
+            try:
+                fp = local_files[rel]
+                with open(fp, 'rb') as f:
+                    raw = f.read()
+                local_sha   = _git_blob_sha(raw)
+                local_mtime = os.path.getmtime(fp)
+            except OSError as e:
+                _github_log.info('SYNC DEBUG: %s OSError: %s', rel, e)
+                continue
+
+        entry    = _state_entry(rel)
+        prev_sha = entry['sha']
+        sync_at  = entry['at']
+
+        if in_local and in_github:
+            gh_sha = github_files[rel]
+
+            # Deletion log wins over both sides: delete from GitHub + local
+            if rel in _deleted_rels:
+                _is_attach = rel.startswith('attachments/')
+                if _is_attach and not _is_attachment_safe_to_delete(rel[len('attachments/'):], ''):
+                    _github_log.info('SYNC DEBUG: KEEP %s — referenced by local note, skipping deletion', rel)
+                    # fall through to normal sync logic
+                else:
+                    _github_log.info('SYNC DEBUG: DELETE %s (in deletion log, cleaning GitHub)', rel)
+                    try:
+                        _gh_request('DELETE', f'{api_base}/contents/{_urlparse.quote(rel, safe="/")}', pat, {
+                            'message': f'sync: delete {rel}',
+                            'sha':     gh_sha,
+                        })
+                    except RuntimeError:
+                        pass
+                    try:
+                        os.remove(local_files[rel])
+                    except OSError:
+                        pass
+                    continue
+
+            if local_sha == gh_sha:
+                # Content identical — no transfer needed
+                new_state[rel] = {'sha': gh_sha, 'at': sync_at}
+                skipped += 1
+                continue
+
+            # Determine what changed since last sync
+            local_changed  = local_mtime > sync_at + 2
+            remote_changed = gh_sha != prev_sha
+
+            if local_changed and remote_changed:
+                # Both PCs changed this file — attempt 3-way merge for .md files
+                if rel.endswith('.md') and prev_sha:
+                    try:
+                        base_bytes   = _gh_fetch_blob(api_base, pat, prev_sha)
+                        r_resp       = _gh_request('GET', f'{api_base}/contents/{_urlparse.quote(rel, safe="/")}', pat)
+                        remote_bytes = base64.b64decode(r_resp['content'].replace('\n', ''))
+                        base_text    = base_bytes.decode('utf-8', errors='replace')
+                        local_text   = raw.decode('utf-8', errors='replace')
+                        remote_text  = remote_bytes.decode('utf-8', errors='replace')
+
+                        # When each side's content was entered decides the order.
+                        # Locally the history sidecar knows; for the remote copy
+                        # its sidecar is fetched from the repo when present,
+                        # falling back to the commit time of the note itself.
+                        local_at  = _note_entry_time(local_files[rel])
+                        remote_at = _gh_remote_entry_time(api_base, pat, rel,
+                                                          github_files, gh_sha)
+
+                        merged_text  = _merge_by_timeline(base_text, local_text, remote_text,
+                                                          local_at, remote_at)
+                        merged_bytes = merged_text.encode('utf-8')
+                        merged_sha   = _git_blob_sha(merged_bytes)
+                        _github_log.info(
+                            'SYNC DEBUG: TIMELINE MERGE %s local_at=%.0f remote_at=%.0f order=%s',
+                            rel, local_at, remote_at,
+                            'remote-first' if remote_at < local_at else 'local-first')
+
+                        if merged_sha == gh_sha:
+                            # All local changes already present in remote — just pull
+                            _pull_file(rel, gh_sha)
+                        elif merged_sha == local_sha:
+                            # Merged same as local — just push local
+                            _push_file(rel, raw, local_sha, gh_sha)
+                        else:
+                            # True merge: push merged content and update local file
+                            _push_file(rel, merged_bytes, merged_sha, gh_sha)
+                            fp  = local_files[rel]
+                            tmp = fp + '.tmp'
+                            with open(tmp, 'wb') as wf:
+                                wf.write(merged_bytes)
+                            os.replace(tmp, fp)
+
+                        continue
+
+                    except Exception as _me:
+                        _github_log.warning('Merge failed for %s: %s — falling back to last-write-wins', rel, _me)
+
+                # Non-.md file or merge failed — last write wins
+                gh_time = _gh_file_commit_time(api_base, pat, rel)
+                if local_mtime >= gh_time:
+                    _push_file(rel, raw, local_sha, gh_sha)
+                else:
+                    _pull_file(rel, gh_sha)
+            elif local_changed:
+                _push_file(rel, raw, local_sha, gh_sha)
+            elif remote_changed:
+                _pull_file(rel, gh_sha)
+            else:
+                # Stale state (sha mismatch but no detected change) — push local
+                _push_file(rel, raw, local_sha, gh_sha)
+
+        elif in_local:
+            # File exists only locally — push to GitHub as a new file
+            _push_file(rel, raw, local_sha, None)
+
+        else:
+            # File exists only on GitHub
+            gh_sha = github_files[rel]
+            if rel in _deleted_rels or prev_sha is not None:
+                # In deletion log, OR was synced before and now missing locally.
+                # Guard: if a local note still references this attachment, pull it
+                # back rather than propagating the deletion to GitHub — the deletion
+                # log entry was stale (note was added/updated after the attachment
+                # was orphaned on this device).
+                _is_attach = rel.startswith('attachments/')
+                if _is_attach and not _is_attachment_safe_to_delete(rel[len('attachments/'):], ''):
+                    _github_log.info(
+                        'SYNC DEBUG: KEEP %s — referenced by local note, pulling instead of deleting', rel)
+                    _pull_file(rel, gh_sha)
+                else:
+                    _github_log.info('SYNC DEBUG: DELETE %s (%s)', rel,
+                                     'in deletion log' if rel in _deleted_rels else 'removed locally')
+                    try:
+                        _gh_request('DELETE', f'{api_base}/contents/{_urlparse.quote(rel, safe="/")}', pat, {
+                            'message': f'sync: delete {rel}',
+                            'sha':     gh_sha,
+                        })
+                    except RuntimeError:
+                        pass
+            else:
+                # Never synced on this PC and not deleted → pull from GitHub
+                _pull_file(rel, gh_sha)
+
+    _gh_save_state(new_state)
+
+    now  = time.time()
+    cfg2 = paths._load_config()
+    cfg2.setdefault('github', {})['last_sync'] = now
+    paths._save_config(cfg2)
+
+    total = {'toRemote': to_remote, 'toLocal': to_local, 'skipped': skipped}
+    _github_log.info('GitHub sync done → %s', total)
+    _orphan_attachment_cleanup(notes_dir, attach_dir, _github_log)
+    _sse_broadcast(json.dumps({'type': 'github_sync', 'result': total, 'lastSync': now}))
+    return {'ok': True, **total}
+
+
+def _github_loop() -> None:
+    _github_log.info('GitHub sync thread started')
+    last_sync_mono = 0.0
+    while True:
+        cfg      = _gh_cfg()
+        enabled  = cfg.get('enabled', False)
+        interval = int(cfg.get('sync_interval', 300))
+        if enabled and cfg.get('connected', False):
+            if _sync_paused_for_editing():
+                _github_log.debug('Sync skipped — note is being edited')
+                _github_wake.clear()
+                _github_wake.wait(timeout=min(_EDITING_GRACE, interval))
+                continue
+            interval_due = (last_sync_mono == 0.0
+                            or time.monotonic() - last_sync_mono >= interval)
+            if not interval_due and not _placeholder_due_now():
+                # Woken early, most likely to take note of a freshly armed
+                # deadline. Sleep again on the recomputed timeout.
+                _github_wake.clear()
+                _github_wake.wait(timeout=_sync_wait_timeout(interval, last_sync_mono))
+                continue
+            _forced = _placeholder_sync_pending()
+            _github_log.debug('Auto-sync starting …')
+            print('[GitHub] SYNC DEBUG: about to call _gh_do_sync()', flush=True)
+            _sse_auto_sync('github', 'start')
+            with _github_sync_lock:
+                try:
+                    result = _gh_do_sync()
+                    _sse_auto_sync('github', 'end', ok=result.get('ok', False), error=result.get('error'),
+                                   to_remote=result.get('toRemote', 0), to_local=result.get('toLocal', 0))
+                    _placeholder_settle(_forced, bool(result.get('ok')))
+                except Exception as e:
+                    _github_log.error('Sync error: %s', e, exc_info=True)
+                    _sse_auto_sync('github', 'end', ok=False, error=str(e))
+                    _placeholder_settle(_forced, False)
+            last_sync_mono = time.monotonic()
+        _github_wake.clear()
+        _github_wake.wait(timeout=_sync_wait_timeout(interval, last_sync_mono))
+
+
+# Start the GitHub sync thread only once: in a frozen exe there is no reloader,
+# and under the Werkzeug reloader only the child process (WERKZEUG_RUN_MAIN=true)
+# must run it — otherwise both processes sync concurrently and race each other
+# (double pushes, 409s, merges against stale state).
+if paths._is_frozen() or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+    _github_thread = threading.Thread(target=_github_loop,
+                                      daemon=True, name='github-sync')
+    _github_thread.start()
+
+
+@app.route('/api/github', methods=['GET'])
+def api_github_get():
+    cfg  = _gh_cfg()
+    last = cfg.get('last_sync', 0)
+    return jsonify({
+        'connected':    cfg.get('connected', False),
+        'enabled':      cfg.get('enabled', True),
+        'repoUrl':      cfg.get('repo_url', ''),
+        'syncInterval': cfg.get('sync_interval', 300),
+        'lastSync':     last,
+        'lastSyncStr':  _dtt.fromtimestamp(last).strftime('%Y-%m-%d %H:%M') if last else '—',
+    })
+
+
+@app.route('/api/github', methods=['POST'])
+def api_github_save():
+    data = request.get_json(force=True, silent=True) or {}
+    cfg  = paths._load_config()
+    g    = cfg.setdefault('github', {})
+    if 'enabled' in data:
+        g['enabled'] = bool(data['enabled'])
+    if 'syncInterval' in data:
+        g['sync_interval'] = int(data['syncInterval'])
+    paths._save_config(cfg)
+    _github_wake.set()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/github/setup', methods=['POST'])
+def api_github_setup():
+    data     = request.get_json(force=True, silent=True) or {}
+    repo_url = data.get('repoUrl', '').strip()
+    pat      = data.get('pat', '').strip()
+    interval = int(data.get('syncInterval', 300))
+    if not repo_url or not pat:
+        return jsonify({'ok': False, 'error': 'Repo URL and PAT are required'}), 400
+    try:
+        _gh_request('GET', _gh_api_base(repo_url), pat)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+
+    _save_gh_pat(pat)
+    cfg = paths._load_config()
+    cfg['github'] = {
+        'repo_url':      repo_url,
+        'connected':     True,
+        'enabled':       interval != 0,
+        'sync_interval': interval or 300,
+        'last_sync':     0,
+    }
+    paths._save_config(cfg)
+    _github_wake.set()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/github/sync', methods=['POST'])
+def api_github_sync_now():
+    with _github_sync_lock:
+        try:
+            result = _gh_do_sync()
+        except Exception as e:
+            _github_log.error('Manual sync error: %s', e, exc_info=True)
+            result = {'ok': False, 'error': str(e)}
+    return jsonify(result)
+
+
+@app.route('/api/github', methods=['DELETE'])
+def api_github_disconnect():
+    cfg = paths._load_config()
+    g   = cfg.get('github', {})
+    g['connected'] = False
+    g['enabled']   = False
+    paths._save_config(cfg)
+    _github_log.info('GitHub disconnected by user')
     return jsonify({'ok': True})
 
 
@@ -3662,6 +5243,28 @@ if not _bi_log.handlers:
     _bih = logging.StreamHandler()
     _bih.setFormatter(logging.Formatter('%(name)s %(message)s'))
     _bi_log.addHandler(_bih)
+
+
+def _dpapi_encrypt(plaintext: bytes) -> bytes:
+    """Encrypt bytes with Windows DPAPI (CryptProtectData) via ctypes."""
+    import ctypes, ctypes.wintypes
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [('cbData', ctypes.wintypes.DWORD),
+                    ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+    buf      = ctypes.create_string_buffer(plaintext, len(plaintext))
+    blob_in  = _BLOB(len(plaintext), buf)
+    blob_out = _BLOB()
+    ok = ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(blob_in), None, None, None, None, 0,
+        ctypes.byref(blob_out))
+    if not ok:
+        raise RuntimeError(
+            f'DPAPI CryptProtectData failed (WinError {ctypes.GetLastError()})')
+    result = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return result
 
 
 def _dpapi_decrypt(data: bytes) -> bytes:
@@ -4145,8 +5748,64 @@ def import_notable():
     })
 
 
+def _purge_deletion_log() -> None:
+    """Remove entries older than 6 months from the local deletion log.
+    Runs at startup so the log stays bounded even without GitHub sync."""
+    log_path = _deletion_log_path()
+    try:
+        data   = _load_deletion_log(log_path)
+        cutoff = time.time() - 180 * 86400
+        before = len(data['deletions'])
+        data['deletions'] = [e for e in data['deletions']
+                             if e.get('deleted_at', 0) > cutoff]
+        if len(data['deletions']) != before:
+            _save_deletion_log(log_path, data)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Window geometry
+# ---------------------------------------------------------------------------
+
+# The frameless maximize deliberately overshoots the work area by a pixel on
+# each edge so DWM's compositor stub falls outside it and the content sits
+# flush in the corner. That much slack is allowed through the clamp below.
+_WORKAREA_PAD = 1
+
+
+def _clamp_rect_to_work_area(x, y, cx, cy, work, moving, resizing):
+    """Keep a window inside the work area. Returns (x, y, cx, cy).
+
+    Size is clamped before position, and that order is the whole point: a
+    window as tall as the monitor cannot be moved anywhere that clears the
+    taskbar, so clamping position alone silently lets a full-screen rect
+    through. Windows then hides the taskbar entirely, because its shell treats
+    any window covering the whole monitor as a fullscreen app.
+    """
+    max_w = (work.right - work.left) + _WORKAREA_PAD * 2
+    max_h = (work.bottom - work.top) + _WORKAREA_PAD * 2
+    if cx > max_w:
+        cx = max_w
+    if cy > max_h:
+        cy = max_h
+
+    lo_x, lo_y = work.left - _WORKAREA_PAD, work.top - _WORKAREA_PAD
+    hi_x, hi_y = work.right + _WORKAREA_PAD, work.bottom + _WORKAREA_PAD
+    if x + cx > hi_x:
+        x = hi_x - cx
+    if y + cy > hi_y:
+        y = hi_y - cy
+    if x < lo_x:
+        x = lo_x
+    if y < lo_y:
+        y = lo_y
+    return x, y, cx, cy
+
+
 if __name__ == '__main__':
     paths.ensure_dirs()
+    _purge_deletion_log()
 
     _frozen = paths._is_frozen()
     # Debug mode only when running from source.  Frozen executables never use
@@ -4300,9 +5959,98 @@ if __name__ == '__main__':
                 return None
 
             def open_url(self, url):
-                """Open a URL in the system default browser."""
-                import subprocess
-                subprocess.Popen(['start', '', url], shell=True)
+                """Open a URL in the system default browser.
+
+                Uses ShellExecute via os.startfile rather than `cmd /c start`:
+                the shell form mangles URLs containing '&' and would execute
+                anything a crafted link smuggled through — and links arrive here
+                from note content, which syncs in from other devices.
+                """
+                try:
+                    scheme = _urlparse.urlparse(url).scheme.lower()
+                except Exception:
+                    return
+                if scheme not in ('http', 'https', 'mailto', 'tel', 'ftp'):
+                    print(f'[myNote] refusing to open URL with scheme {scheme!r}', flush=True)
+                    return
+                try:
+                    os.startfile(url)
+                except OSError as exc:
+                    print(f'[myNote] could not open {url}: {exc}', flush=True)
+
+        # ── Workarea guard ────────────────────────────────────────────────────
+        # frameless WS_POPUP windows are not automatically clamped to the work
+        # area by Windows during user drag/resize, so the window can slide under
+        # the taskbar.  We subclass the WndProc to intercept WM_WINDOWPOSCHANGING
+        # and enforce the work area boundaries before the position is applied.
+
+        _orig_wndproc_ptr: int = 0
+        _new_wndproc_ref       = None   # held at module scope to prevent GC
+
+        class _WINDOWPOS(ctypes.Structure):
+            _fields_ = [
+                ('hwnd',            ctypes.wintypes.HWND),
+                ('hwndInsertAfter', ctypes.wintypes.HWND),
+                ('x',   ctypes.c_int),
+                ('y',   ctypes.c_int),
+                ('cx',  ctypes.c_int),
+                ('cy',  ctypes.c_int),
+                ('flags', ctypes.c_uint),
+            ]
+
+        _WNDPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_long,
+            ctypes.wintypes.HWND,
+            ctypes.c_uint,
+            ctypes.wintypes.WPARAM,
+            ctypes.wintypes.LPARAM,
+        )
+
+        def _install_workarea_guard(hwnd: int) -> None:
+            global _orig_wndproc_ptr, _new_wndproc_ref
+
+            _GWLP_WNDPROC         = -4
+            _SWP_NOMOVE           = 0x0002
+            _SWP_NOSIZE           = 0x0001
+            _WM_WINDOWPOSCHANGING = 0x0046
+            _SPI_GETWORKAREA      = 0x0030
+
+            u32 = ctypes.windll.user32
+            u32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+            u32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+            u32.CallWindowProcW.restype   = ctypes.c_long
+
+            def _proc(hwnd, msg, wparam, lparam):
+                if msg == _WM_WINDOWPOSCHANGING:
+                    wp = ctypes.cast(lparam, ctypes.POINTER(_WINDOWPOS)).contents
+                    work = ctypes.wintypes.RECT()
+                    u32.SystemParametersInfoW(_SPI_GETWORKAREA, 0, ctypes.byref(work), 0)
+
+                    moving   = not (wp.flags & _SWP_NOMOVE)
+                    resizing = not (wp.flags & _SWP_NOSIZE)
+
+                    cur = ctypes.wintypes.RECT()
+                    u32.GetWindowRect(hwnd, ctypes.byref(cur))
+                    x  = wp.x  if moving   else cur.left
+                    y  = wp.y  if moving   else cur.top
+                    cx = wp.cx if resizing else (cur.right  - cur.left)
+                    cy = wp.cy if resizing else (cur.bottom - cur.top)
+
+                    nx, ny, ncx, ncy = _clamp_rect_to_work_area(
+                        x, y, cx, cy, work, moving, resizing)
+
+                    if moving:
+                        wp.x,  wp.y  = nx,  ny
+                    if resizing:
+                        wp.cx, wp.cy = ncx, ncy
+
+                return u32.CallWindowProcW(_orig_wndproc_ptr, hwnd, msg, wparam, lparam)
+
+            _new_wndproc_ref  = _WNDPROC(_proc)
+            _orig_wndproc_ptr = u32.GetWindowLongPtrW(hwnd, _GWLP_WNDPROC)
+            u32.SetWindowLongPtrW(
+                hwnd, _GWLP_WNDPROC,
+                ctypes.cast(_new_wndproc_ref, ctypes.c_void_p).value)
 
         def _run_flask():
             app.run(
@@ -4329,9 +6077,32 @@ if __name__ == '__main__':
             resizable=True,
             frameless=True,
             easy_drag=False,
+            text_select=True,
             js_api=_api,
         )
         _api._win = _wv_win      # wire back-reference after creation
+
+        def _on_window_loaded():
+            hwnd = _api._get_main_hwnd()
+            if not hwnd:
+                return
+            _install_workarea_guard(hwnd)
+            # Nudge the window through the guard once. If it came up already
+            # covering the whole monitor — restored geometry, or sized before
+            # the hook existed — nothing else would trigger a clamp, and the
+            # shell would keep the taskbar hidden for as long as it is focused.
+            try:
+                r = ctypes.wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+                SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, 0, r.left, r.top,
+                    r.right - r.left, r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE)
+            except Exception:
+                pass
+        _wv_win.events.loaded += _on_window_loaded
+
         webview.start(
             icon=_icon_path if os.path.exists(_icon_path) else None,
         )
